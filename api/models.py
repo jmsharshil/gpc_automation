@@ -3,7 +3,7 @@ from django.conf import settings
 
 class Company(models.Model):
     company_id = models.CharField(max_length=200, blank=True, null=True, unique=True)
-    name = models.CharField(max_length=512, unique=True)
+    name = models.CharField(max_length=1024, unique=True)
 
     # descriptive fields (keep these)
     exchange_ticker = models.CharField(max_length=200, blank=True, null=True)
