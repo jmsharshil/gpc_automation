@@ -12,7 +12,7 @@ class Company(models.Model):
     headquarters_country_region = models.CharField(max_length=256, blank=True, null=True)
     website = models.CharField(max_length=512, blank=True, null=True)
     business_description = models.TextField(blank=True, null=True)
-    industry_classifications = models.CharField(max_length=512, blank=True, null=True)
+    industry_classifications = models.CharField(max_length=1024, blank=True, null=True)
     country = models.CharField(max_length=256, blank=True, null=True)
 
     def __str__(self):
