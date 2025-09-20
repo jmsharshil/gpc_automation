@@ -1,15 +1,20 @@
-# safe version: no snapshot updates, less DB churn, and UploadJob logging
+# api/utils_master_sheet.py
+import logging
 import pandas as pd
 from decimal import Decimal, InvalidOperation
-from django.db import transaction
+
+from django.db import transaction, DataError
+from django.core.exceptions import FieldDoesNotExist
+from django.conf import settings
+
 from .models import Company, FinancialRecord
-from api.models import UploadJob  # adjust import if in different app
-import logging
+from api.models import UploadJob  # adjust import if UploadJob lives elsewhere
 
 logger = logging.getLogger(__name__)
 
 MASTER_SHEET_NAME = "Master database Screening"
 EMPTY_TOKENS = {"", "-", "—", "na", "n/a", "none", "null", "nan", "--"}
+
 
 def _norm_str(val):
     if pd.isna(val):
@@ -18,6 +23,7 @@ def _norm_str(val):
     if s.lower() in EMPTY_TOKENS:
         return None
     return s
+
 
 def _parse_decimal(val):
     if pd.isna(val):
@@ -39,19 +45,39 @@ def _parse_decimal(val):
         except Exception:
             return None
 
+
+def _truncate_for_model(model_cls, attr_name, value):
+    """
+    If value is a string and model field has max_length and value is longer,
+    return (truncated_value, True). Otherwise return (value, False).
+    """
+    if value is None or not isinstance(value, str):
+        return value, False
+    try:
+        field = model_cls._meta.get_field(attr_name)
+    except FieldDoesNotExist:
+        return value, False
+    max_length = getattr(field, 'max_length', None)
+    if max_length and len(value) > max_length:
+        return value[:max_length], True
+    return value, False
+
+
 def _fr_values_equal(fr_obj, defaults):
-    """Return True if all numeric/default values are equal (None and Decimal compare correctly)."""
     for k, v in defaults.items():
         if getattr(fr_obj, k) != v:
             return False
     return True
 
+
 def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_by=None, save_file_to_job=False):
     """
-    Reads the sheet and upserts Companies + FinancialRecord. Does NOT update Company snapshot fields.
-    - update_snapshot parameter is kept for compatibility but will be ignored (no snapshot fields on Company).
-    - uploaded_by can be a user instance to attach to UploadJob (optional).
-    - save_file_to_job: if True, UploadJob.file = uploaded_file will be saved (ensure storage supports it).
+    Safe importer that:
+      - creates an UploadJob before processing
+      - truncates fields that would overflow DB columns
+      - processes each row in its own small transaction so one bad row doesn't break everything
+      - does NOT update Company snapshot fields (update_snapshot kept for backward compat)
+    Returns summary dict.
     """
     try:
         df = pd.read_excel(uploaded_file, sheet_name=MASTER_SHEET_NAME, header=1, engine='openpyxl')
@@ -59,8 +85,9 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
         return {'error': f'Failed to read sheet \"{MASTER_SHEET_NAME}\": {str(e)}'}
 
     df.columns = [str(c).strip() for c in df.columns]
+
     if "Company Name" not in df.columns:
-        return {'error': 'Required column \"Company Name\" not found in header (row 2).'}
+        return {'error': 'Required column "Company Name" not found in header (row 2).'}
 
     created_companies = 0
     updated_companies = 0
@@ -71,29 +98,31 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
 
     companies_cache = {}
 
-    # Create UploadJob now so we can attach file/filename and update summary later
+    # Create UploadJob before processing so we persist metadata even if atomic fails
     job = UploadJob.objects.create(
         uploaded_by=uploaded_by if uploaded_by and getattr(uploaded_by, 'is_authenticated', False) else None,
         filename=getattr(uploaded_file, 'name', '') or '',
+        summary={}
     )
     if save_file_to_job:
         try:
-            job.file = uploaded_file
-            job.save(update_fields=['file'])
+            # Save file to the FileField if desired (may require storage configured)
+            job.file.save(getattr(uploaded_file, 'name', 'uploaded.xlsx'), uploaded_file)
         except Exception:
-            # don't fail upload if saving file is not possible
-            logger.exception("Could not save uploaded file into UploadJob.file")
+            logger.exception("Could not save uploaded file into UploadJob.file (non-fatal)")
 
-    with transaction.atomic():
-        for idx, row in df.iterrows():
-            excel_row = int(idx) + 3
-            try:
+    for idx, row in df.iterrows():
+        excel_row = int(idx) + 3
+        # Use per-row atomic block so one row failure doesn't mark whole transaction broken
+        try:
+            with transaction.atomic():
                 raw_name = row.get("Company Name")
                 name = _norm_str(raw_name)
                 if not name:
                     skipped += 1
                     continue
 
+                # read and normalize descriptive fields
                 exchange_ticker = _norm_str(row.get("Exchange:Ticker"))
                 primary_sector = _norm_str(row.get("Primary Sector"))
                 primary_industry = _norm_str(row.get("Primary Industry"))
@@ -104,13 +133,42 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                 country = _norm_str(row.get("Country"))
                 excel_company_id = _norm_str(row.get("Excel Company ID"))
 
+                # numeric fields
                 market_cap = _parse_decimal(row.get("Market Capitalization [My Setting] [Latest] ($USDmm, Historical rate)"))
                 total_revenue = _parse_decimal(row.get("Total Revenue [LTM] ($USDmm, Historical rate)"))
                 enterprise_value = _parse_decimal(row.get("Total Enterprise Value [My Setting] [Latest] ($USDmm, Historical rate)"))
                 ebitda = _parse_decimal(row.get("EBITDA [LTM] ($USDmm, Historical rate)"))
                 ev_revenu = _parse_decimal(row.get("EV/ Revenu"))
 
-                # find/create company (prefer Excel Company ID)
+                # Truncate strings so DB won't reject them
+                truncated_fields = {}
+                name, t = _truncate_for_model(Company, 'name', name)
+                if t: truncated_fields['name'] = True
+                exchange_ticker, t = _truncate_for_model(Company, 'exchange_ticker', exchange_ticker); 
+                if t: truncated_fields['exchange_ticker'] = True
+                primary_sector, t = _truncate_for_model(Company, 'primary_sector', primary_sector);
+                if t: truncated_fields['primary_sector'] = True
+                primary_industry, t = _truncate_for_model(Company, 'primary_industry', primary_industry);
+                if t: truncated_fields['primary_industry'] = True
+                headquarters, t = _truncate_for_model(Company, 'headquarters_country_region', headquarters);
+                if t: truncated_fields['headquarters_country_region'] = True
+                website, t = _truncate_for_model(Company, 'website', website);
+                if t: truncated_fields['website'] = True
+                industry_classifications, t = _truncate_for_model(Company, 'industry_classifications', industry_classifications);
+                if t: truncated_fields['industry_classifications'] = True
+                country, t = _truncate_for_model(Company, 'country', country);
+                if t: truncated_fields['country'] = True
+                excel_company_id, t = _truncate_for_model(Company, 'company_id', excel_company_id);
+                if t: truncated_fields['company_id'] = True
+
+                if truncated_fields:
+                    errors.append({
+                        'row': excel_row,
+                        'warning': 'Truncated fields to fit DB column lengths',
+                        'truncated_fields': list(truncated_fields.keys())
+                    })
+
+                # Find or create company (prefer Excel Company ID)
                 company_key = excel_company_id or name.lower()
                 company = companies_cache.get(company_key)
                 if not company:
@@ -119,19 +177,26 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                     if not company:
                         company = Company.objects.filter(name__iexact=name).first()
                     if not company:
-                        company = Company.objects.create(
-                            company_id=excel_company_id,
-                            name=name,
-                            exchange_ticker=exchange_ticker,
-                            primary_sector=primary_sector,
-                            primary_industry=primary_industry,
-                            headquarters_country_region=headquarters,
-                            website=website,
-                            business_description=business_description,
-                            industry_classifications=industry_classifications,
-                            country=country
-                        )
-                        created_companies += 1
+                        # Create company
+                        try:
+                            company = Company.objects.create(
+                                company_id=excel_company_id,
+                                name=name,
+                                exchange_ticker=exchange_ticker,
+                                primary_sector=primary_sector,
+                                primary_industry=primary_industry,
+                                headquarters_country_region=headquarters,
+                                website=website,
+                                business_description=business_description,
+                                industry_classifications=industry_classifications,
+                                country=country
+                            )
+                            created_companies += 1
+                        except DataError as e:
+                            # Defensive: if DB still rejects, record error and skip this row
+                            logger.exception("DataError creating Company on row %s: %s", excel_row, e)
+                            errors.append({'row': excel_row, 'error': f'DataError creating Company: {str(e)}'})
+                            continue
                     else:
                         # update descriptive fields only if present and changed
                         updated_fields = []
@@ -151,12 +216,17 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                         set_if_present('industry_classifications', industry_classifications)
                         set_if_present('country', country)
                         if updated_fields:
-                            company.save(update_fields=updated_fields)
-                            updated_companies += 1
+                            try:
+                                company.save(update_fields=updated_fields)
+                                updated_companies += 1
+                            except DataError as e:
+                                logger.exception("DataError updating Company on row %s: %s", excel_row, e)
+                                errors.append({'row': excel_row, 'error': f'DataError updating Company: {str(e)}'})
+                                continue
 
                     companies_cache[company_key] = company
 
-                # Upsert FinancialRecord with period='latest'
+                # Upsert FinancialRecord (period='latest')
                 period = 'latest'
                 fr_defaults = {
                     'market_cap': market_cap,
@@ -166,33 +236,50 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                     'ev_revenu': ev_revenu
                 }
 
-                # Try to find existing FR
                 fr = FinancialRecord.objects.filter(company=company, period=period).first()
                 if not fr:
-                    FinancialRecord.objects.create(company=company, period=period, **fr_defaults)
-                    created_records += 1
+                    try:
+                        FinancialRecord.objects.create(company=company, period=period, **fr_defaults)
+                        created_records += 1
+                    except DataError as e:
+                        logger.exception("DataError creating FinancialRecord on row %s: %s", excel_row, e)
+                        errors.append({'row': excel_row, 'error': f'DataError creating FinancialRecord: {str(e)}'})
+                        continue
                 else:
-                    # Only update if something changed (reduce writes)
+                    # update only if changed
                     if not _fr_values_equal(fr, fr_defaults):
                         for k, v in fr_defaults.items():
                             setattr(fr, k, v)
-                        fr.save(update_fields=[k for k in fr_defaults.keys()])
-                        updated_records += 1
+                        try:
+                            fr.save(update_fields=[k for k in fr_defaults.keys()])
+                            updated_records += 1
+                        except DataError as e:
+                            logger.exception("DataError updating FinancialRecord on row %s: %s", excel_row, e)
+                            errors.append({'row': excel_row, 'error': f'DataError updating FinancialRecord: {str(e)}'})
+                            continue
 
-            except Exception as e:
-                logger.exception("Error processing row %s", excel_row)
-                errors.append({'row': excel_row, 'error': str(e)})
+                # NOTE: we intentionally skip Company snapshot updates to avoid writing to non-existent latest_* fields
+                # If you later add snapshot fields to Company model, enable update_snapshot and add guarded checks.
+        except Exception as e:
+            # Catch any unexpected exceptions per-row to continue processing others.
+            logger.exception("Unexpected error processing row %s: %s", excel_row, e)
+            errors.append({'row': excel_row, 'error': f'Unexpected error: {str(e)}'})
+            continue
 
-        # update job summary and save
-        summary = {
-            'created_companies': created_companies,
-            'updated_companies': updated_companies,
-            'created_records': created_records,
-            'updated_records': updated_records,
-            'skipped_rows': skipped,
-            'errors': errors
-        }
+    # After loop: update job summary outside per-row transactions
+    summary = {
+        'created_companies': created_companies,
+        'updated_companies': updated_companies,
+        'created_records': created_records,
+        'updated_records': updated_records,
+        'skipped_rows': skipped,
+        'errors': errors
+    }
+    try:
         job.summary = summary
         job.save(update_fields=['summary'])
+    except Exception:
+        # If saving fails, at least log it; return summary to caller
+        logger.exception("Failed to save UploadJob.summary for job %s", job.pk)
 
     return summary

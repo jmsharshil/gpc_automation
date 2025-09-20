@@ -24,7 +24,13 @@ class ExcelUploadAPIView(APIView):
         if not uploaded_file:
             return Response({'error': 'No file provided in field "file".'}, status=status.HTTP_400_BAD_REQUEST)
 
-        summary = process_master_screening_v2(uploaded_file, update_snapshot=True)
+        # call importer - do not attempt snapshot update (set False)
+        summary = process_master_screening_v2(
+            uploaded_file,
+            update_snapshot=False,
+            uploaded_by=request.user if hasattr(request, 'user') else None,
+            save_file_to_job=True
+        )
         if 'error' in summary:
             return Response(summary, status=status.HTTP_400_BAD_REQUEST)
         return Response(summary, status=status.HTTP_200_OK)
