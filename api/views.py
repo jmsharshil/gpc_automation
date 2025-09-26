@@ -15,6 +15,10 @@ from .serializers import DashboardSummarySerializer, CompanySerializer, Financia
 from .utils_master_sheet import process_master_screening_v2
 import re
 from django.db.models import Q
+import openai
+from django.conf import settings
+from .utils.openai_helpers import call_openai_compare
+from rest_framework.response import Response
 
 class ExcelUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
@@ -214,12 +218,23 @@ class CompanyListAPIView(generics.ListAPIView):
         qs_companies = Company.objects.all()
 
         # Company-level filters
-        country = self.request.GET.get('headquarters_country_region') or self.request.GET.get('country')
+        raw_countries = self.request.GET.getlist('headquarters_country_region') or self.request.GET.getlist('country')
         primary_sector = self.request.GET.get('primary_sector')
         primary_industry = self.request.GET.get('primary_industry')
 
-        if country:
-            qs_companies = qs_companies.filter(headquarters_country_region__iexact=country)
+        if not raw_countries:
+            single = self.request.GET.get('headquarters_country_region') or self.request.GET.get('country')
+            if single:
+                # split on comma/semicolon/pipe and strip whitespace
+                raw_countries = [c.strip() for c in re.split(r'[;,|]+', single) if c.strip()]
+
+        # Now raw_countries is a list like ['India', 'USA']
+        if raw_countries:
+            q_country = Q()
+            for c in raw_countries:
+                # case-insensitive exact match
+                q_country |= Q(headquarters_country_region__iexact=c)
+            qs_companies = qs_companies.filter(q_country)
         if primary_sector:
             qs_companies = qs_companies.filter(primary_sector__icontains=primary_sector)
         if primary_industry:
@@ -349,20 +364,77 @@ class CompanyListAPIView(generics.ListAPIView):
         return qs_companies
 
     def list(self, request, *args, **kwargs):
+        compare_desc = request.GET.get('compare_description')  # user's 3-4 lines to compare
         queryset = self.get_queryset()
         page = self.paginate_queryset(queryset)
         if page is not None:
+            # attach latest record reference for serializer
             for comp in page:
                 matched = getattr(comp, 'matched_records', None)
                 comp._latest_record = matched[0] if matched else None
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
 
+            # If user provided compare_description, call OpenAI for each company in the page
+            if compare_desc:
+                # WARNING: This is synchronous and will add latency. See notes below.
+                for comp in page:
+                    company_bdesc = comp.business_description or ""
+                    ai_out = call_openai_compare(company_bdesc, compare_desc)
+                    # attach for serializer or response
+                    comp._ai_similarity = ai_out.get("similarity")
+                    comp._ai_rationale = ai_out.get("rationale")
+
+            serializer = self.get_serializer(page, many=True)
+            data = serializer.data
+
+            # Now inject AI fields into serialized data (so they are visible in API)
+            if compare_desc:
+                # serialized order matches page
+                for idx, comp_obj in enumerate(page):
+                    ai_sim = getattr(comp_obj, "_ai_similarity", None)
+                    ai_rat = getattr(comp_obj, "_ai_rationale", None)
+                    # Where to place them? Add top-level keys under company object
+                    data[idx]["business_model_similarity"] = ai_sim
+                    data[idx]["ai_rationale"] = ai_rat
+
+            return self.get_paginated_response(data)
+
+        # non-paginated path (same logic)
         for comp in queryset:
             matched = getattr(comp, 'matched_records', None)
             comp._latest_record = matched[0] if matched else None
+
+        if compare_desc:
+            for comp in queryset:
+                company_bdesc = comp.business_description or ""
+                ai_out = call_openai_compare(company_bdesc, compare_desc)
+                comp._ai_similarity = ai_out.get("similarity")
+                comp._ai_rationale = ai_out.get("rationale")
+
         serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        data = serializer.data
+        if compare_desc:
+            for idx, comp_obj in enumerate(queryset):
+                data[idx]["business_model_similarity"] = getattr(comp_obj, "_ai_similarity", None)
+                data[idx]["ai_rationale"] = getattr(comp_obj, "_ai_rationale", None)
+
+        return Response(data)
+
+
+    # def list(self, request, *args, **kwargs):
+    #     queryset = self.get_queryset()
+    #     page = self.paginate_queryset(queryset)
+    #     if page is not None:
+    #         for comp in page:
+    #             matched = getattr(comp, 'matched_records', None)
+    #             comp._latest_record = matched[0] if matched else None
+    #         serializer = self.get_serializer(page, many=True)
+    #         return self.get_paginated_response(serializer.data)
+
+    #     for comp in queryset:
+    #         matched = getattr(comp, 'matched_records', None)
+    #         comp._latest_record = matched[0] if matched else None
+    #     serializer = self.get_serializer(queryset, many=True)
+    #     return Response(serializer.data)
 
 
 

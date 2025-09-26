@@ -30,7 +30,9 @@ DEBUG = False
 
 ALLOWED_HOSTS = ['localhost','127.0.0.1','gpc-h0eth6gagwh3f3ad.centralindia-01.azurewebsites.net']
 
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # choose a model you have access to
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "15"))  # seconds
 # Application definition
 
 INSTALLED_APPS = [
