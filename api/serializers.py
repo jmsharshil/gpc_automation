@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from .models import Company, FinancialRecord
-
+from django.conf import settings
 
 class GroupCountSerializer(serializers.Serializer):
     name = serializers.CharField()
@@ -54,5 +54,19 @@ class CompanySerializer(serializers.ModelSerializer):
         if not record:
             return None
         return FinancialRecordSerializer(record).data
+    
+MAX_COMPANIES = getattr(settings, "COMPARE_MAX_COMPANIES", 10)    
+class AdhocCompanySerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, allow_blank=True)
+    description = serializers.CharField()
 
+class CompareRequestSerializer(serializers.Serializer):
+    compare_description = serializers.CharField()
+    companies = AdhocCompanySerializer(many=True)
 
+    def validate_companies(self, value):
+        if len(value) > MAX_COMPANIES:
+            raise serializers.ValidationError(
+                f"Too many companies. Max allowed is {MAX_COMPANIES}."
+            )
+        return value

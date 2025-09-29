@@ -11,7 +11,7 @@ from rest_framework import generics
 from rest_framework.pagination import PageNumberPagination
 
 from .models import Company, FinancialRecord
-from .serializers import DashboardSummarySerializer, CompanySerializer, FinancialRecordSerializer
+from .serializers import DashboardSummarySerializer, CompanySerializer, FinancialRecordSerializer, CompareRequestSerializer
 from .utils_master_sheet import process_master_screening_v2
 import re
 from django.db.models import Q
@@ -19,6 +19,9 @@ import openai
 from django.conf import settings
 from .utils.openai_helpers import call_openai_compare
 from rest_framework.response import Response
+import json
+from rest_framework import status
+from rest_framework import serializers, status
 
 class ExcelUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
@@ -363,8 +366,43 @@ class CompanyListAPIView(generics.ListAPIView):
 
         return qs_companies
 
+    def _parse_extra_companies(self, request):
+        """
+        Returns list of dicts: [{"name": "...", "description": "..."}, ...]
+        Accepts:
+         - extra_company_name + extra_company_description (single pair)
+         - extra_companies = JSON list string
+        """
+        extras = []
+        # single-pair
+        name = request.GET.get('extra_company_name')
+        desc = request.GET.get('extra_company_description')
+        if name or desc:
+            extras.append({"name": name or "", "description": desc or ""})
+
+        # JSON list
+        raw = request.GET.get('extra_companies')
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if not isinstance(item, dict):
+                            continue
+                        extras.append({
+                            "name": item.get("name", "") or "",
+                            "description": item.get("description", "") or ""
+                        })
+            except Exception:
+                # ignore malformed JSON - caller will get no extra entries
+                pass
+        return extras
+
     def list(self, request, *args, **kwargs):
         compare_desc = request.GET.get('compare_description')  # user's 3-4 lines to compare
+        # parse potential ad-hoc companies to compare
+        extra_companies = self._parse_extra_companies(request)
+
         queryset = self.get_queryset()
         page = self.paginate_queryset(queryset)
         if page is not None:
@@ -379,24 +417,38 @@ class CompanyListAPIView(generics.ListAPIView):
                 for comp in page:
                     company_bdesc = comp.business_description or ""
                     ai_out = call_openai_compare(company_bdesc, compare_desc)
-                    # attach for serializer or response
                     comp._ai_similarity = ai_out.get("similarity")
                     comp._ai_rationale = ai_out.get("rationale")
 
             serializer = self.get_serializer(page, many=True)
             data = serializer.data
 
-            # Now inject AI fields into serialized data (so they are visible in API)
+            # Inject AI fields into serialized data (so they are visible in API)
             if compare_desc:
-                # serialized order matches page
                 for idx, comp_obj in enumerate(page):
-                    ai_sim = getattr(comp_obj, "_ai_similarity", None)
-                    ai_rat = getattr(comp_obj, "_ai_rationale", None)
-                    # Where to place them? Add top-level keys under company object
-                    data[idx]["business_model_similarity"] = ai_sim
-                    data[idx]["ai_rationale"] = ai_rat
+                    data[idx]["business_model_similarity"] = getattr(comp_obj, "_ai_similarity", None)
+                    data[idx]["ai_rationale"] = getattr(comp_obj, "_ai_rationale", None)
 
-            return self.get_paginated_response(data)
+            # Build extra comparisons for ad-hoc companies (if provided)
+            extra_results = []
+            if compare_desc and extra_companies:
+                for extra in extra_companies:
+                    # safe default for missing description
+                    comp_desc = extra.get("description") or ""
+                    ai_out = call_openai_compare(comp_desc, compare_desc)
+                    extra_results.append({
+                        "name": extra.get("name") or None,
+                        "description": comp_desc,
+                        "business_model_similarity": ai_out.get("similarity"),
+                        "ai_rationale": ai_out.get("rationale")
+                    })
+
+            # get the paginated response and then augment it
+            resp = self.get_paginated_response(data)
+            if extra_results:
+                # attach under a new key
+                resp.data['extra_comparisons'] = extra_results
+            return resp
 
         # non-paginated path (same logic)
         for comp in queryset:
@@ -412,12 +464,32 @@ class CompanyListAPIView(generics.ListAPIView):
 
         serializer = self.get_serializer(queryset, many=True)
         data = serializer.data
+
         if compare_desc:
             for idx, comp_obj in enumerate(queryset):
                 data[idx]["business_model_similarity"] = getattr(comp_obj, "_ai_similarity", None)
                 data[idx]["ai_rationale"] = getattr(comp_obj, "_ai_rationale", None)
 
-        return Response(data)
+        # extra comparisons for non-paginated
+        extra_results = []
+        if compare_desc and extra_companies:
+            for extra in extra_companies:
+                comp_desc = extra.get("description") or ""
+                ai_out = call_openai_compare(comp_desc, compare_desc)
+                extra_results.append({
+                    "name": extra.get("name") or None,
+                    "description": comp_desc,
+                    "business_model_similarity": ai_out.get("similarity"),
+                    "ai_rationale": ai_out.get("rationale")
+                })
+
+        final_payload = {
+            "results": data,
+        }
+        if extra_results:
+            final_payload["extra_comparisons"] = extra_results
+
+        return Response(final_payload, status=status.HTTP_200_OK)
 
 
     # def list(self, request, *args, **kwargs):
@@ -438,6 +510,43 @@ class CompanyListAPIView(generics.ListAPIView):
 
 
 
+
+
+
+MAX_DESC_CHARS = getattr(settings, "COMPARE_MAX_DESC_CHARS", 1200)
+class CompareAPIView(APIView):
+    """
+    POST /api/companies/compare/
+    Body: {"compare_description": "...", "companies": [{name, description}, ...]}
+    Returns: list of results with similarity + rationale
+    """
+
+    def post(self, request, *args, **kwargs):
+        serializer = CompareRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        compare_desc = serializer.validated_data["compare_description"]
+        companies = serializer.validated_data["companies"]
+
+        results = []
+        # Iterate sequentially (synchronous). call_openai_compare already handles exceptions.
+        for comp in companies:
+            name = comp.get("name") or None
+            desc = (comp.get("description") or "")[:MAX_DESC_CHARS]  # trim for safety
+            ai_out = call_openai_compare(desc, compare_desc)
+            results.append({
+                "name": name,
+                "description": desc,
+                "business_model_similarity": ai_out.get("similarity"),
+                "ai_rationale": ai_out.get("rationale")
+            })
+
+        payload = {
+            "compare_description": compare_desc,
+            "results": results,
+            "meta": {"company_count": len(results)}
+        }
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 
