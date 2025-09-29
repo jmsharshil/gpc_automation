@@ -526,7 +526,7 @@ class CompareAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         compare_desc = serializer.validated_data["compare_description"]
-        companies = serializer.validated_data["companies"]
+        companies = serializer.validated_data.get("companies", [])
 
         results = []
         # Iterate sequentially (synchronous). call_openai_compare already handles exceptions.

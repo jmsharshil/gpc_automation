@@ -57,12 +57,12 @@ class CompanySerializer(serializers.ModelSerializer):
     
 MAX_COMPANIES = getattr(settings, "COMPARE_MAX_COMPANIES", 10)    
 class AdhocCompanySerializer(serializers.Serializer):
-    name = serializers.CharField(required=False, allow_blank=True)
-    description = serializers.CharField()
+    name = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    description = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 class CompareRequestSerializer(serializers.Serializer):
-    compare_description = serializers.CharField()
-    companies = AdhocCompanySerializer(many=True)
+    compare_description = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    companies = AdhocCompanySerializer(many=True, required=False)
 
     def validate_companies(self, value):
         if len(value) > MAX_COMPANIES:
