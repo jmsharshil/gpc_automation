@@ -22,6 +22,8 @@ from rest_framework.response import Response
 import json
 from rest_framework import status
 from rest_framework import serializers, status
+from django.db.models import Count
+from django.db.models.functions import Lower, Trim
 
 class ExcelUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
@@ -404,6 +406,28 @@ class CompanyListAPIView(generics.ListAPIView):
         extra_companies = self._parse_extra_companies(request)
 
         queryset = self.get_queryset()
+        # --- compute counts for the full filtered queryset (before pagination) ---
+        # normalize text by trimming + lowercasing so "India" and " india " are grouped
+        country_count = queryset.values_list('headquarters_country_region', flat=True) \
+        .exclude(headquarters_country_region__isnull=True) \
+        .exclude(headquarters_country_region__exact="") \
+        .distinct().count()
+
+        sector_count = queryset.values_list('primary_sector', flat=True) \
+        .exclude(primary_sector__isnull=True) \
+        .exclude(primary_sector__exact="") \
+        .distinct().count()
+
+        industry_count = queryset.values_list('primary_industry', flat=True) \
+        .exclude(primary_industry__isnull=True) \
+        .exclude(primary_industry__exact="") \
+        .distinct().count()
+
+        counts_payload = {
+            "countries": country_count,
+            "sectors": sector_count,
+            "industries": industry_count,
+        }
         page = self.paginate_queryset(queryset)
         if page is not None:
             # attach latest record reference for serializer
@@ -445,6 +469,7 @@ class CompanyListAPIView(generics.ListAPIView):
 
             # get the paginated response and then augment it
             resp = self.get_paginated_response(data)
+            resp.data['counts'] = counts_payload
             if extra_results:
                 # attach under a new key
                 resp.data['extra_comparisons'] = extra_results
