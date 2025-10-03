@@ -10,7 +10,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read # Required for actions/checkout
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -20,23 +20,74 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # Optional: Add tests here (e.g., pytest)
+      - name: Zip deploy folder
+        run: zip -r deployment.zip . -x "*.git*" "*__pycache__*" "venv/*"
 
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'gpc'
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_33321CB31A5444648222AD7700F41E06 }}
-          package: .
+          package: deployment.zip
+
+# Added new workflow - because previous flow takes too much space
+
+# name: Build and deploy Python app to Azure Web App - gpc
+
+# on:
+#   push:
+#     branches:
+#       - main
+#   workflow_dispatch:
+
+# jobs:
+#   build-and-deploy:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       contents: read # Required for actions/checkout
+
+#     steps:
+#       - uses: actions/checkout@v4
+
+#       - name: Set up Python version
+#         uses: actions/setup-python@v5
+#         with:
+#           python-version: '3.12'
+
+#       - name: Install dependencies
+#         run: |
+#           python -m venv venv
+#           source venv/bin/activate
+#           pip install -r requirements.txt
+
+#       # Optional: Add tests here (e.g., pytest)
+
+#       - name: 'Deploy to Azure Web App'
+#         uses: azure/webapps-deploy@v3
+#         with:
+#           app-name: 'gpc'
+#           slot-name: 'Production'
+#           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_33321CB31A5444648222AD7700F41E06 }}
+#           package: .
 
 
+
+
+
+
+# Old - By Default Workflow 
 
 # # Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
 # # More GitHub Actions for Azure: https://github.com/Azure/actions

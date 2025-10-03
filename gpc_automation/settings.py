@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'user_auth',
     'api',
+    'crm_chat',
 ]
 
 REST_FRAMEWORK = {

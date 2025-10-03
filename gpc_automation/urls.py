@@ -21,4 +21,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path("auth/", include("user_auth.urls")),
     path('api/v1/', include('api.urls')),
+    path('api/v1/', include("crm_chat.urls")),
 ]
