@@ -24,6 +24,10 @@ from rest_framework import status
 from rest_framework import serializers, status
 from django.db.models import Count
 from django.db.models.functions import Lower, Trim
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from django.core.cache import cache
 
 class ExcelUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
@@ -209,6 +213,29 @@ def _build_q_for_terms(terms, condition='OR', field='business_description'):
         else:
             q = (q & term_q) if cond == 'AND' else (q | term_q)
     return q
+
+def _cache_key_for_compare(company_id_or_desc: str, compare_desc: str) -> str:
+    key_src = f"{company_id_or_desc}||{compare_desc}"
+    return "ai_cmp:" + hashlib.sha256(key_src.encode('utf-8')).hexdigest()
+
+# wrapper to call the AI with safe handling
+def _safe_call_openai_compare(company_desc: str, compare_desc: str):
+    """
+    Calls call_openai_compare and returns dict or None on failure.
+    Keeps wrapper generic — exceptions are swallowed and return None.
+    """
+    try:
+        out = call_openai_compare(company_desc, compare_desc)
+        if not isinstance(out, dict):
+            return None
+        return {
+            "similarity": out.get("similarity"),
+            "rationale": out.get("rationale"),
+        }
+    except Exception:
+        # You should log exception in production
+        return None
+
 
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200
@@ -437,42 +464,89 @@ class CompanyListAPIView(generics.ListAPIView):
 
         queryset = self.get_queryset()
         # --- compute counts for the full filtered queryset (before pagination) ---
-        # normalize text by trimming + lowercasing so "India" and " india " are grouped
         country_count = queryset.values_list('headquarters_country_region', flat=True) \
-        .exclude(headquarters_country_region__isnull=True) \
-        .exclude(headquarters_country_region__exact="") \
-        .distinct().count()
+            .exclude(headquarters_country_region__isnull=True) \
+            .exclude(headquarters_country_region__exact="") \
+            .distinct().count()
 
         sector_count = queryset.values_list('primary_sector', flat=True) \
-        .exclude(primary_sector__isnull=True) \
-        .exclude(primary_sector__exact="") \
-        .distinct().count()
+            .exclude(primary_sector__isnull=True) \
+            .exclude(primary_sector__exact="") \
+            .distinct().count()
 
         industry_count = queryset.values_list('primary_industry', flat=True) \
-        .exclude(primary_industry__isnull=True) \
-        .exclude(primary_industry__exact="") \
-        .distinct().count()
+            .exclude(primary_industry__isnull=True) \
+            .exclude(primary_industry__exact="") \
+            .distinct().count()
 
         counts_payload = {
             "countries": country_count,
             "sectors": sector_count,
             "industries": industry_count,
         }
+
         page = self.paginate_queryset(queryset)
+        # configuration you can tune
+        MAX_WORKERS = 6           # number of concurrent model calls
+        PER_FUTURE_TIMEOUT = 10   # seconds per model call
+        CACHE_TTL = 60 * 60 * 6   # 6 hours cache TTL
+
+        def _populate_ai_for_list(items):
+            """
+            items: iterable of company instances (page or queryset)
+            Attaches _ai_similarity and _ai_rationale to each company object.
+            Uses cache + ThreadPoolExecutor + per-call fallback.
+            """
+            # collect comps that need remote calls
+            pending = []
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                for comp in items:
+                    comp._ai_similarity = None
+                    comp._ai_rationale = None
+
+                    # determine cache key: prefer stable ID if present
+                    key_id = getattr(comp, "id", None) or (comp.business_description or "")
+                    ck = _cache_key_for_compare(str(key_id), compare_desc)
+                    cached = cache.get(ck) if compare_desc else None
+                    if cached is not None:
+                        comp._ai_similarity = cached.get("similarity")
+                        comp._ai_rationale = cached.get("rationale")
+                        continue
+
+                    # schedule a call if compare_desc provided
+                    if compare_desc:
+                        # submit async call
+                        future = ex.submit(_safe_call_openai_compare, comp.business_description or "", compare_desc)
+                        pending.append((comp, future, ck))
+
+                # gather results
+                for comp, fut, ck in pending:
+                    try:
+                        res = fut.result(timeout=PER_FUTURE_TIMEOUT)
+                    except Exception:
+                        res = None
+
+                    if res:
+                        comp._ai_similarity = res.get("similarity")
+                        comp._ai_rationale = res.get("rationale")
+                        try:
+                            cache.set(ck, {"similarity": comp._ai_similarity, "rationale": comp._ai_rationale}, CACHE_TTL)
+                        except Exception:
+                            # ignore cache failures; don't break main flow
+                            pass
+                    else:
+                        comp._ai_similarity = None
+                        comp._ai_rationale = None
+
         if page is not None:
             # attach latest record reference for serializer
             for comp in page:
                 matched = getattr(comp, 'matched_records', None)
                 comp._latest_record = matched[0] if matched else None
 
-            # If user provided compare_description, call OpenAI for each company in the page
+            # call AI (cached + parallel) only if compare_desc provided
             if compare_desc:
-                # WARNING: This is synchronous and will add latency. See notes below.
-                for comp in page:
-                    company_bdesc = comp.business_description or ""
-                    ai_out = call_openai_compare(company_bdesc, compare_desc)
-                    comp._ai_similarity = ai_out.get("similarity")
-                    comp._ai_rationale = ai_out.get("rationale")
+                _populate_ai_for_list(page)
 
             serializer = self.get_serializer(page, many=True)
             data = serializer.data
@@ -486,22 +560,21 @@ class CompanyListAPIView(generics.ListAPIView):
             # Build extra comparisons for ad-hoc companies (if provided)
             extra_results = []
             if compare_desc and extra_companies:
+                # these are ad-hoc entries; we can compute them synchronously but with same safe wrapper
                 for extra in extra_companies:
-                    # safe default for missing description
                     comp_desc = extra.get("description") or ""
-                    ai_out = call_openai_compare(comp_desc, compare_desc)
+                    ai_out = _safe_call_openai_compare(comp_desc, compare_desc)
                     extra_results.append({
                         "name": extra.get("name") or None,
                         "description": comp_desc,
-                        "business_model_similarity": ai_out.get("similarity"),
-                        "ai_rationale": ai_out.get("rationale")
+                        "business_model_similarity": ai_out.get("similarity") if ai_out else None,
+                        "ai_rationale": ai_out.get("rationale") if ai_out else None
                     })
 
             # get the paginated response and then augment it
             resp = self.get_paginated_response(data)
             resp.data['counts'] = counts_payload
             if extra_results:
-                # attach under a new key
                 resp.data['extra_comparisons'] = extra_results
             return resp
 
@@ -511,11 +584,7 @@ class CompanyListAPIView(generics.ListAPIView):
             comp._latest_record = matched[0] if matched else None
 
         if compare_desc:
-            for comp in queryset:
-                company_bdesc = comp.business_description or ""
-                ai_out = call_openai_compare(company_bdesc, compare_desc)
-                comp._ai_similarity = ai_out.get("similarity")
-                comp._ai_rationale = ai_out.get("rationale")
+            _populate_ai_for_list(queryset)
 
         serializer = self.get_serializer(queryset, many=True)
         data = serializer.data
@@ -530,12 +599,12 @@ class CompanyListAPIView(generics.ListAPIView):
         if compare_desc and extra_companies:
             for extra in extra_companies:
                 comp_desc = extra.get("description") or ""
-                ai_out = call_openai_compare(comp_desc, compare_desc)
+                ai_out = _safe_call_openai_compare(comp_desc, compare_desc)
                 extra_results.append({
                     "name": extra.get("name") or None,
                     "description": comp_desc,
-                    "business_model_similarity": ai_out.get("similarity"),
-                    "ai_rationale": ai_out.get("rationale")
+                    "business_model_similarity": ai_out.get("similarity") if ai_out else None,
+                    "ai_rationale": ai_out.get("rationale") if ai_out else None
                 })
 
         final_payload = {
@@ -543,7 +612,6 @@ class CompanyListAPIView(generics.ListAPIView):
         }
         if extra_results:
             final_payload["extra_comparisons"] = extra_results
-
         return Response(final_payload, status=status.HTTP_200_OK)
 
 
