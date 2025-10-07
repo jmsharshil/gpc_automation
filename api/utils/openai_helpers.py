@@ -84,66 +84,66 @@ def call_openai_compare(company_desc, user_desc, model=None, timeout=None):
     model = model or getattr(settings, "OPENAI_MODEL", "gpt-3.5-turbo")
     timeout = timeout or getattr(settings, "OPENAI_TIMEOUT", 15)
 
-#     prompt = f"""
-# You are an assistant that compares business descriptions.
-
-# Input:
-# - company_description: \"\"\"{company_desc or ''}\"\"\"
-# - subject_description: \"\"\"{user_desc or ''}\"\"\"
-
-# Task:
-# You are performing comparable company screening for a private company valuation using the Guideline Public Company (GPC) Method.
-
-# Steps:
-# 1. Read and understand the subject company’s business model, technology, and end markets.
-# 2. Read the public company’s business description.
-# 3. Apply the screening logic as follows:
-#    - Each entry in screening_keywords is treated as a separate screening phrase.
-#    - For each phrase:
-#        - Split the phrase into individual words.
-#        - The phrase matches only if **all words** in that phrase appear anywhere in the business description, in any order or sentence.
-#        - Matching is **case-insensitive**.
-#        - **Word stemming is applied**: words are matched to their root forms (for example, “acquire” matches “acquiring”, “acquired”, “acquisition”).
-#        - If any word in a phrase is missing, that phrase does not match.
-#    - Apply **OR logic** across all phrases:
-#        - If at least one phrase fully matches, set `passes_screen` to "Yes".
-#        - If none match, set `passes_screen` to "No".
-# 4. Based on qualitative similarity between the subject company and the public company, assign a similarity category:
-#    - "High" → Strong overlap in industry, technology, and target markets.
-#    - "Medium" → Partial overlap in technology or market focus.
-#    - "Low" → Minimal or no overlap in business model, industry, or technology.
- 
-# Return a JSON object exactly with these keys:
-# - similarity: must be one of "High", "Medium", or "Low" (exactly those strings, capitalized).
-# - passes_screen: must be "Yes" if at least one screening phrase matched, otherwise "No".
-# - rationale: a concise (1–3 sentence) explanation describing the similarity level and screening outcome.
- 
-# Constraints:
-# - Output only valid JSON (no extra commentary or formatting).
-# - Matching is case-insensitive, allows words to appear in any order or sentence, and applies stemming.
-# - All words in a multi-word phrase must be present for a match.
-# - Keep rationale concise (1–3 sentences).
-# - If company_description is empty, set similarity to "Low", passes_screen to "No", and rationale to "Insufficient company information to assess comparability."
-# """
-
-
     prompt = f"""
 You are an assistant that compares business descriptions.
 
 Input:
 - company_description: \"\"\"{company_desc or ''}\"\"\"
-- user_description: \"\"\"{user_desc or ''}\"\"\"
+- subject_description: \"\"\"{user_desc or ''}\"\"\"
 
 Task:
+You are performing comparable company screening for a private company valuation using the Guideline Public Company (GPC) Method.
+
+Steps:
+1. Read and understand the subject company’s business model, technology, and end markets.
+2. Read the public company’s business description.
+3. Apply the screening logic as follows:
+   - Each entry in screening_keywords is treated as a separate screening phrase.
+   - For each phrase:
+       - Split the phrase into individual words.
+       - The phrase matches only if **all words** in that phrase appear anywhere in the business description, in any order or sentence.
+       - Matching is **case-insensitive**.
+       - **Word stemming is applied**: words are matched to their root forms (for example, “acquire” matches “acquiring”, “acquired”, “acquisition”).
+       - If any word in a phrase is missing, that phrase does not match.
+   - Apply **OR logic** across all phrases:
+       - If at least one phrase fully matches, set `passes_screen` to "Yes".
+       - If none match, set `passes_screen` to "No".
+4. Based on qualitative similarity between the subject company and the public company, assign a similarity category:
+   - "High" → Strong overlap in industry, technology, and target markets.
+   - "Medium" → Partial overlap in technology or market focus.
+   - "Low" → Minimal or no overlap in business model, industry, or technology.
+ 
 Return a JSON object exactly with these keys:
 - similarity: must be one of "High", "Medium", or "Low" (exactly those strings, capitalized).
-- rationale: a short explanation (1-3 sentences) explaining why you chose that similarity.
-
+- passes_screen: must be "Yes" if at least one screening phrase matched, otherwise "No".
+- rationale: a concise (1–3 sentence) explanation describing the similarity level and screening outcome.
+ 
 Constraints:
-- Produce only valid JSON (no extra commentary).
-- Keep rationale concise (one to three short sentences).
-- If company_description is empty, set similarity to "Low" and rationale to explain missing data.
+- Output only valid JSON (no extra commentary or formatting).
+- Matching is case-insensitive, allows words to appear in any order or sentence, and applies stemming.
+- All words in a multi-word phrase must be present for a match.
+- Keep rationale concise (1–3 sentences).
+- If company_description is empty, set similarity to "Low", passes_screen to "No", and rationale to "Insufficient company information to assess comparability."
 """
+
+
+#     prompt = f"""
+# You are an assistant that compares business descriptions.
+
+# Input:
+# - company_description: \"\"\"{company_desc or ''}\"\"\"
+# - user_description: \"\"\"{user_desc or ''}\"\"\"
+
+# Task:
+# Return a JSON object exactly with these keys:
+# - similarity: must be one of "High", "Medium", or "Low" (exactly those strings, capitalized).
+# - rationale: a short explanation (1-3 sentences) explaining why you chose that similarity.
+
+# Constraints:
+# - Produce only valid JSON (no extra commentary).
+# - Keep rationale concise (one to three short sentences).
+# - If company_description is empty, set similarity to "Low" and rationale to explain missing data.
+# """
 
     try:
         resp = client.chat.completions.create(
