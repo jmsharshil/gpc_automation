@@ -320,12 +320,24 @@ class CompanyListAPIView(generics.ListAPIView):
             if not raw:
                 continue
             cond = cond_list[i] if i < len(cond_list) else 'OR'
-            # split terms inside this keywords entry by , ; |  (space-only means single phrase)
+            # split on explicit delimiters first (comma/semicolon/pipe)
             terms = [t.strip() for t in re.split(r'[;,|]+', raw) if t.strip()]
+
+            # If the user provided a single phrase with spaces (e.g. "Fleet Management")
+            # and there were no explicit delimiters, treat it as multiple words and
+            # require ALL words to appear (force AND between the words).
+            cond_local = cond
+            if len(terms) == 1 and ' ' in terms[0]:
+                words = [w.strip() for w in re.split(r'\s+', terms[0]) if w.strip()]
+                if words:
+                    terms = words
+                    cond_local = 'AND'  # force AND between space-separated words
+
             if terms:
-                q_group = _build_q_for_terms(terms, condition=cond, field='business_description')
+                q_group = _build_q_for_terms(terms, condition=cond_local, field='business_description')
                 if q_group is not None:
                     groups_q.append(q_group)
+
 
         # 2) explicit keyword_group param (each group encodes its own condition)
         # Format per value: "term1,term2|AND" (condition optional, defaults to OR)
@@ -337,9 +349,18 @@ class CompanyListAPIView(generics.ListAPIView):
                 cond = cond_part.strip().upper() or 'OR'
             else:
                 terms_part, cond = raw_group, 'OR'
+
             terms = [t.strip() for t in re.split(r'[;,|]+', terms_part) if t.strip()]
+
+            cond_local = cond
+            if len(terms) == 1 and ' ' in terms[0]:
+                words = [w.strip() for w in re.split(r'\s+', terms[0]) if w.strip()]
+                if words:
+                    terms = words
+                    cond_local = 'AND'
+
             if terms:
-                q_group = _build_q_for_terms(terms, condition=cond, field='business_description')
+                q_group = _build_q_for_terms(terms, condition=cond_local, field='business_description')
                 if q_group is not None:
                     groups_q.append(q_group)
 
@@ -349,8 +370,17 @@ class CompanyListAPIView(generics.ListAPIView):
             if legacy:
                 legacy_cond = (self.request.GET.get('keyword_condition') or 'OR').strip().upper()
                 parts = [p.strip() for p in re.split(r'[;,|]+', legacy) if p.strip()]
+
+                cond_local = legacy_cond
+                # if single phrase with spaces, split into words and force AND
+                if len(parts) == 1 and ' ' in parts[0]:
+                    words = [w.strip() for w in re.split(r'\s+', parts[0]) if w.strip()]
+                    if words:
+                        parts = words
+                        cond_local = 'AND'
+
                 if parts:
-                    q_legacy = _build_q_for_terms(parts, condition=legacy_cond, field='business_description')
+                    q_legacy = _build_q_for_terms(parts, condition=cond_local, field='business_description')
                     if q_legacy is not None:
                         groups_q.append(q_legacy)
 
