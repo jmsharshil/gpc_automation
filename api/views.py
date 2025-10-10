@@ -605,12 +605,11 @@ class CompanyListAPIView(generics.ListAPIView):
                     # For AND conditions, apply filter immediately to reduce dataset
                     if op == 'AND' or (g_idx == 0 and global_group_operator == 'AND'):
                         if g['type'] == 'SAME_SENTENCE':
-                            # OPTIMIZATION 2: Use regex for phrase matching (faster than Python loop)
+                            # OPTIMIZATION 2: Chain multiple icontains for phrase matching
+                            # This works reliably across SQLite and PostgreSQL
                             words = g['words']
-                            # Build regex pattern: all words must appear (with word boundaries)
-                            # This is executed in DB, much faster than loading into Python
-                            pattern = r'\b' + r'\b.*\b'.join(re.escape(w) for w in words) + r'\b'
-                            temp_qs = temp_qs.filter(business_description__iregex=pattern)
+                            for word in words:
+                                temp_qs = temp_qs.filter(business_description__icontains=word)
                         else:
                             # Apply simple icontains filter
                             for word in g['words']:
@@ -618,9 +617,11 @@ class CompanyListAPIView(generics.ListAPIView):
                     else:
                         # For OR conditions, build Q object as before
                         if g['type'] == 'SAME_SENTENCE':
+                            # Chain multiple icontains for phrase matching (works across all databases)
                             words = g['words']
-                            pattern = r'\b' + r'\b.*\b'.join(re.escape(w) for w in words) + r'\b'
-                            q_part = Q(business_description__iregex=pattern)
+                            q_part = Q()
+                            for word in words:
+                                q_part &= Q(business_description__icontains=word)
                         else:
                             q_part = g['q']
                         
