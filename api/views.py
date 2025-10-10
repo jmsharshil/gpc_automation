@@ -429,9 +429,9 @@ class CompanyListAPIView(generics.ListAPIView):
     serializer_class = CompanySerializer
     pagination_class = StandardResultsSetPagination
 
-    @method_decorator(cache_page(60 * 2))
-    def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
+    # @method_decorator(cache_page(60 * 2))
+    # def get(self, request, *args, **kwargs):
+    #     return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
         qs_companies = Company.objects.all()
