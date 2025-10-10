@@ -28,6 +28,23 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from django.core.cache import cache
+import itertools
+import re
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+import re
+from django.db import connection
+import re
+from nltk.stem.porter import PorterStemmer
+from django.db.models import Q
+import re
+import html
+import unicodedata
+from nltk.stem.porter import PorterStemmer
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+
+_stemmer = PorterStemmer()
 
 class ExcelUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
@@ -177,10 +194,10 @@ class IndustryListAPIView(APIView):
             'industries': results
         })
 
-class StandardResultsSetPagination(PageNumberPagination):
-    page_size = 50
-    page_size_query_param = 'page_size'
-    max_page_size = 500
+# class StandardResultsSetPagination(PageNumberPagination):
+#     page_size = 50
+#     page_size_query_param = 'page_size'
+#     max_page_size = 500
 
 def _get_decimal(value):
     if value is None or value == '':
@@ -200,19 +217,185 @@ def _get_decimal(value):
 
 # helper to build a Q for a list of terms with AND/OR between those terms
 def _build_q_for_terms(terms, condition='OR', field='business_description'):
+    """
+    terms: list[str] (words or quoted phrases)
+    condition: 'AND' | 'OR' | 'SAME_SENTENCE'
+      - SAME_SENTENCE => require all words to appear within the same sentence
+    field: model field name
+    Returns: Q object or None
+    """
     if not terms:
         return None
-    cond = (condition or 'OR').strip().upper()
-    q = None
+
+    terms = [t.strip() for t in terms if t and t.strip()]
+    if not terms:
+        return None
+
+    db_engine = (connection.settings_dict.get('ENGINE', '') or '').lower()
+    is_postgres = 'postgres' in db_engine or 'psycopg2' in db_engine
+    is_mysql = 'mysql' in db_engine or 'mariadb' in db_engine
+
+    if condition == 'SAME_SENTENCE':
+        MAX_SPAN = 300
+        MAX_LOOKAHEAD_WORDS = 5
+
+        if len(terms) == 1:
+            return Q(**{f"{field}__icontains": terms[0]})
+
+        if len(terms) == 2:
+            a, b = re.escape(terms[0]), re.escape(terms[1])
+            pattern = rf'(\b{a}\b[^\.\?\!\n\r]{{0,{MAX_SPAN}}}\b{b}\b)|(\b{b}\b[^\.\?\!\n\r]{{0,{MAX_SPAN}}}\b{a}\b)'
+            if is_postgres:
+                return Q(**{f"{field}__iregex": pattern})
+            elif is_mysql:
+                try:
+                    return Q(**{f"{field}__regex": pattern})
+                except Exception:
+                    return Q(**{f"{field}__icontains": terms[0]}) & Q(**{f"{field}__icontains": terms[1]})
+            else:
+                try:
+                    return Q(**{f"{field}__iregex": pattern})
+                except Exception:
+                    return Q(**{f"{field}__icontains": terms[0]}) & Q(**{f"{field}__icontains": terms[1]})
+
+        if 2 < len(terms) <= MAX_LOOKAHEAD_WORDS:
+            escaped = [re.escape(w) for w in terms]
+            lookaheads = ''.join(r'(?=[^\.\?\!\n\r]{0,' + str(MAX_SPAN) + r'}\b' + w + r'\b)' for w in escaped)
+            pattern = r'(' + lookaheads + r'[^\.\?\!\n\r]{0,' + str(MAX_SPAN) + r'})'
+            if is_postgres:
+                return Q(**{f"{field}__iregex": pattern})
+            elif is_mysql:
+                try:
+                    return Q(**{f"{field}__regex": pattern})
+                except Exception:
+                    q_total = None
+                    for term in terms:
+                        sub_q = Q(**{f"{field}__icontains": term})
+                        q_total = sub_q if q_total is None else (q_total & sub_q)
+                    return q_total
+            else:
+                q_total = None
+                for term in terms:
+                    sub_q = Q(**{f"{field}__icontains": term})
+                    q_total = sub_q if q_total is None else (q_total & sub_q)
+                return q_total
+
+        # fallback for too many words
+        q_total = None
+        for term in terms:
+            sub_q = Q(**{f"{field}__icontains": term})
+            q_total = sub_q if q_total is None else (q_total & sub_q)
+        return q_total
+
+    # Normal AND/OR/phrase handling
+    q_total = None
     for term in terms:
         if not term:
             continue
-        term_q = Q(**{f'{field}__icontains': term})
-        if q is None:
-            q = term_q
+        is_quoted = (len(term) >= 2) and (term[0] == term[-1] and term[0] in ("'", '"'))
+        if is_quoted:
+            t = term[1:-1].strip()
+            if not t:
+                continue
+            sub_q = Q(**{f"{field}__icontains": t})
         else:
-            q = (q & term_q) if cond == 'AND' else (q | term_q)
-    return q
+            sub_q = Q(**{f"{field}__icontains": term})
+
+        if q_total is None:
+            q_total = sub_q
+        else:
+            if condition == 'AND':
+                q_total &= sub_q
+            else:
+                q_total |= sub_q
+    return q_total
+
+_stemmer = PorterStemmer()
+
+def _normalize_text_for_matching(s: str) -> str:
+    """Normalize unicode, decode HTML entities, replace NBSP and weird spaces, and trim."""
+    if not s:
+        return ""
+    # Unicode normalization
+    s = unicodedata.normalize('NFKC', s)
+    # HTML entity decode
+    s = html.unescape(s)
+    # Replace non-breaking spaces and other odd spaces with normal space
+    s = re.sub(r'[\u00A0\u2000-\u200B\u202F\u205F\u3000]', ' ', s)
+    # Collapse repeated whitespace
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def _sentence_matches_phrase(description: str, words: list[str]) -> bool:
+    """
+    Return True if ALL words (after stemming) are present within the same sentence
+    of `description`. Sentences are split on `. ? !` or newline. Uses normalization.
+    """
+    if not description or not words:
+        return False
+
+    # normalize description first
+    description = _normalize_text_for_matching(description)
+
+    # prepare stems for query words
+    q_stems = [ _stemmer.stem(w.lower()) for w in words if w and w.strip() ]
+    if not q_stems:
+        return False
+
+    # split into sentences (note: we keep punctuation boundaries)
+    sentences = re.split(r'(?<=[\.\?\!])\s+|\r?\n+', description)
+    for s in sentences:
+        # robust tokenization: letters/numbers plus apostrophes inside words
+        raw_tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", s.lower())
+        # split hyphenated tokens
+        tokens = []
+        for t in raw_tokens:
+            if '-' in t:
+                tokens.extend([p for p in re.split(r'[-]', t) if p])
+            else:
+                tokens.append(t)
+        if not tokens:
+            continue
+        s_stems = set(_stemmer.stem(tok) for tok in tokens)
+        if all(qs in s_stems for qs in q_stems):
+            return True
+    return False
+
+def _stem_prefilter_q_for_words(field, words):
+    """
+    Build a Q that matches rows where each word (by stem) appears somewhere.
+    For each word we create a regex like r'\b<stem>\w*\b' so 'management' -> stem 'manag' matches 'manage','management','managing'.
+    For multiple words we AND the per-word Qs.
+    """
+    db_engine = (connection.settings_dict.get('ENGINE', '') or '').lower()
+    is_postgres = 'postgres' in db_engine or 'psycopg2' in db_engine
+    is_mysql = 'mysql' in db_engine or 'mariadb' in db_engine
+
+    q_total = None
+    for w in words:
+        if not w or not w.strip():
+            continue
+        stem = _stemmer.stem(w.lower())
+        # safe regex: word boundary, stem, then zero-or-more word chars (matches variations)
+        pattern = rf'\b{re.escape(stem)}\w*\b'
+
+        # prefer DB regexes (case-insensitive). Postgres: __iregex. MySQL: __regex (collation may control case).
+        sub_q = None
+        if is_postgres:
+            sub_q = Q(**{f"{field}__iregex": pattern})
+        elif is_mysql:
+            # Use (?i) for case-insensitive if supported, otherwise rely on collation
+            try:
+                sub_q = Q(**{f"{field}__regex": '(?i)' + pattern})
+            except Exception:
+                sub_q = Q(**{f"{field}__regex": pattern})
+        else:
+            # fallback: use icontains on the stem (less precise but works on sqlite or weird backends)
+            sub_q = Q(**{f"{field}__icontains": stem})
+
+        q_total = sub_q if q_total is None else (q_total & sub_q)
+
+    return q_total
 
 def _cache_key_for_compare(company_id_or_desc: str, compare_desc: str) -> str:
     key_src = f"{company_id_or_desc}||{compare_desc}"
@@ -245,6 +428,10 @@ class StandardResultsSetPagination(PageNumberPagination):
 class CompanyListAPIView(generics.ListAPIView):
     serializer_class = CompanySerializer
     pagination_class = StandardResultsSetPagination
+
+    @method_decorator(cache_page(60 * 2))
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
         qs_companies = Company.objects.all()
@@ -331,97 +518,172 @@ class CompanyListAPIView(generics.ListAPIView):
         # final combination of groups uses `group_operator` (default AND)
         # ---------------------------
 
-        groups_q = []
+        group_objects = []  # each entry: {"type": "SAME_SENTENCE" or "OTHER", "words": [...], "q": Q}
 
-        # 1) index-paired repeated keywords (matches your screenshot)
-        # Accept both 'keywords' and 'keyword' param names (frontend may send either)
+        # helper to create a simple Q for a list of words (AND icontains)
+        def _q_and_icontains(field, words):
+            q = None
+            for w in words:
+                sub = Q(**{f"{field}__icontains": w})
+                q = sub if q is None else (q & sub)
+            return q
+
+        def _add_group_from_raw(raw_val, combine_with_prev=None):
+            if ',' not in raw_val and ';' not in raw_val and '|' not in raw_val and ' ' in raw_val:
+                words = [w.strip() for w in re.split(r'\s+', raw_val) if w.strip()]
+                if words:
+                    q_loose = _stem_prefilter_q_for_words('business_description', words)
+                    group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
+                return
+
+            parts = [p.strip() for p in re.split(r'[;,|]+', raw_val) if p.strip()]
+            for p in parts:
+                if ' ' in p:
+                    words = [w.strip() for w in re.split(r'\s+', p) if w.strip()]
+                    if words:
+                        q_loose = _stem_prefilter_q_for_words('business_description', words)
+                        group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
+                else:
+                    group_objects.append({"type": "OTHER", "words": [p], "q": Q(**{'business_description__icontains': p}), "combine_with_prev": combine_with_prev})
+
+        kw_cond_list = [c.strip().upper() for c in self.request.GET.getlist('keyword_condition') if c.strip()]
+        if not kw_cond_list:
+            kw_cond_list = [c.strip().upper() for c in self.request.GET.getlist('keyword_conditions') if c.strip()]
+
         kw_list = self.request.GET.getlist('keywords') or self.request.GET.getlist('keyword')
-        cond_list = self.request.GET.getlist('keyword_condition')  # repeated per box
-
-        # normalize cond_list and extend if shorter than kw_list
-        cond_list = [c.strip().upper() if c else 'OR' for c in cond_list]
-        if len(cond_list) < len(kw_list):
-            cond_list += ['OR'] * (len(kw_list) - len(cond_list))
-
-        for i, raw in enumerate(kw_list):
+        for idx, raw in enumerate(kw_list):
             if not raw:
                 continue
-            cond = cond_list[i] if i < len(cond_list) else 'OR'
-            # split on explicit delimiters first (comma/semicolon/pipe)
-            terms = [t.strip() for t in re.split(r'[;,|]+', raw) if t.strip()]
+            combine_with_prev = kw_cond_list[idx] if idx < len(kw_cond_list) else None
+            for chunk in [c.strip() for c in re.split(r'[;,]+', raw) if c.strip()]:
+                _add_group_from_raw(chunk, combine_with_prev=combine_with_prev)
 
-            # If the user provided a single phrase with spaces (e.g. "Fleet Management")
-            # and there were no explicit delimiters, treat it as multiple words and
-            # require ALL words to appear (force AND between the words).
-            cond_local = cond
-            if len(terms) == 1 and ' ' in terms[0]:
-                words = [w.strip() for w in re.split(r'\s+', terms[0]) if w.strip()]
-                if words:
-                    terms = words
-                    cond_local = 'AND'  # force AND between space-separated words
-
-            if terms:
-                q_group = _build_q_for_terms(terms, condition=cond_local, field='business_description')
-                if q_group is not None:
-                    groups_q.append(q_group)
-
-
-        # 2) explicit keyword_group param (each group encodes its own condition)
-        # Format per value: "term1,term2|AND" (condition optional, defaults to OR)
         for raw_group in self.request.GET.getlist('keyword_group'):
             if not raw_group:
                 continue
+            combine_with_prev = None
             if '|' in raw_group:
                 terms_part, cond_part = raw_group.rsplit('|', 1)
-                cond = cond_part.strip().upper() or 'OR'
+                combine_with_prev = cond_part.strip().upper() or None
             else:
-                terms_part, cond = raw_group, 'OR'
+                terms_part = raw_group
+            for chunk in [c.strip() for c in re.split(r'[;,]+', terms_part) if c.strip()]:
+                _add_group_from_raw(chunk, combine_with_prev=combine_with_prev)
 
-            terms = [t.strip() for t in re.split(r'[;,|]+', terms_part) if t.strip()]
-
-            cond_local = cond
-            if len(terms) == 1 and ' ' in terms[0]:
-                words = [w.strip() for w in re.split(r'\s+', terms[0]) if w.strip()]
-                if words:
-                    terms = words
-                    cond_local = 'AND'
-
-            if terms:
-                q_group = _build_q_for_terms(terms, condition=cond_local, field='business_description')
-                if q_group is not None:
-                    groups_q.append(q_group)
-
-        # 3) legacy single keywords param (if nothing else provided)
-        if not groups_q:
+        if not group_objects:
             legacy = self.request.GET.get('keywords') or self.request.GET.get('keyword')
             if legacy:
-                legacy_cond = (self.request.GET.get('keyword_condition') or 'OR').strip().upper()
-                parts = [p.strip() for p in re.split(r'[;,|]+', legacy) if p.strip()]
+                for chunk in [c.strip() for c in re.split(r'[;,]+', legacy) if c.strip()]:
+                    _add_group_from_raw(chunk, combine_with_prev=None)
 
-                cond_local = legacy_cond
-                # if single phrase with spaces, split into words and force AND
-                if len(parts) == 1 and ' ' in parts[0]:
-                    words = [w.strip() for w in re.split(r'\s+', parts[0]) if w.strip()]
-                    if words:
-                        parts = words
-                        cond_local = 'AND'
+        if not group_objects:
+            final_keyword_q = None
+        else:
+            # ============================================
+            # KEY OPTIMIZATION: Separate AND and OR groups
+            # Process AND groups FIRST to reduce dataset early
+            # ============================================
+            global_group_operator = (self.request.GET.get('group_operator') or 'OR').strip().upper()
+            
+            # Identify if we have AND conditions
+            has_and_conditions = any(
+                (g.get('combine_with_prev') == 'AND' or 
+                (g.get('combine_with_prev') is None and global_group_operator == 'AND'))
+                for g in group_objects
+            )
+            
+            if has_and_conditions:
+                # OPTIMIZATION 1: Apply filters progressively for AND conditions
+                # This reduces the dataset size early, making subsequent filters faster
+                
+                temp_qs = qs_companies
+                final_keyword_q = None
+                
+                for g_idx, g in enumerate(group_objects):
+                    op = (g.get('combine_with_prev') or global_group_operator or 'OR')
+                    
+                    # For AND conditions, apply filter immediately to reduce dataset
+                    if op == 'AND' or (g_idx == 0 and global_group_operator == 'AND'):
+                        if g['type'] == 'SAME_SENTENCE':
+                            # OPTIMIZATION 2: Use regex for phrase matching (faster than Python loop)
+                            words = g['words']
+                            # Build regex pattern: all words must appear (with word boundaries)
+                            # This is executed in DB, much faster than loading into Python
+                            pattern = r'\b' + r'\b.*\b'.join(re.escape(w) for w in words) + r'\b'
+                            temp_qs = temp_qs.filter(business_description__iregex=pattern)
+                        else:
+                            # Apply simple icontains filter
+                            for word in g['words']:
+                                temp_qs = temp_qs.filter(business_description__icontains=word)
+                    else:
+                        # For OR conditions, build Q object as before
+                        if g['type'] == 'SAME_SENTENCE':
+                            words = g['words']
+                            pattern = r'\b' + r'\b.*\b'.join(re.escape(w) for w in words) + r'\b'
+                            q_part = Q(business_description__iregex=pattern)
+                        else:
+                            q_part = g['q']
+                        
+                        if final_keyword_q is None:
+                            final_keyword_q = q_part
+                        else:
+                            final_keyword_q |= q_part
+                
+                # Apply any remaining OR conditions
+                if final_keyword_q is not None:
+                    temp_qs = temp_qs.filter(final_keyword_q)
+                
+                qs_companies = temp_qs
+            
+            else:
+                # ORIGINAL LOGIC: For OR-only conditions (already fast)
+                # Build prefilter
+                prefilter_q = None
+                for g in group_objects:
+                    if g.get('q') is None:
+                        continue
+                    prefilter_q = g['q'] if prefilter_q is None else (prefilter_q | g['q'])
 
-                if parts:
-                    q_legacy = _build_q_for_terms(parts, condition=cond_local, field='business_description')
-                    if q_legacy is not None:
-                        groups_q.append(q_legacy)
+                candidate_qs = qs_companies.filter(prefilter_q) if prefilter_q is not None else qs_companies
 
-        # Combine all groups into a single Q using group_operator (default AND)
-        final_keyword_q = None
-        if groups_q:
-            group_operator = (self.request.GET.get('group_operator') or 'AND').strip().upper()
-            final_keyword_q = groups_q[0]
-            for g in groups_q[1:]:
-                final_keyword_q = (final_keyword_q & g) if group_operator == 'AND' else (final_keyword_q | g)
+                # SAME_SENTENCE groups: precise verification
+                same_sentence_groups = [g for g in group_objects if g['type'] == 'SAME_SENTENCE']
+                same_group_id_sets = []
+                
+                if same_sentence_groups:
+                    # OPTIMIZATION 3: Limit fields loaded into memory
+                    for comp in candidate_qs.only('id', 'business_description'):
+                        desc = comp.business_description or ""
+                        for g_idx, g in enumerate(same_sentence_groups):
+                            if _sentence_matches_phrase(desc, g['words']):
+                                if len(same_group_id_sets) <= g_idx:
+                                    while len(same_group_id_sets) <= g_idx:
+                                        same_group_id_sets.append(set())
+                                same_group_id_sets[g_idx].add(comp.id)
 
-        # Apply final keyword filter
-        if final_keyword_q is not None:
-            qs_companies = qs_companies.filter(final_keyword_q)
+                # Build final Q
+                final_keyword_q = None
+                ss_index = 0
+                
+                for g in group_objects:
+                    if g['type'] == 'SAME_SENTENCE':
+                        ids = same_group_id_sets[ss_index] if ss_index < len(same_group_id_sets) else set()
+                        ss_index += 1
+                        q_part = Q(id__in=list(ids)) if ids else Q(id__in=[])
+                    else:
+                        q_part = g['q']
+
+                    if final_keyword_q is None:
+                        final_keyword_q = q_part
+                    else:
+                        op = (g.get('combine_with_prev') or global_group_operator or 'OR')
+                        if op == 'AND':
+                            final_keyword_q &= q_part
+                        else:
+                            final_keyword_q |= q_part
+
+                if final_keyword_q is not None:
+                    qs_companies = qs_companies.filter(final_keyword_q)
 
         return qs_companies
 
@@ -496,47 +758,70 @@ class CompanyListAPIView(generics.ListAPIView):
             items: iterable of company instances (page or queryset)
             Attaches _ai_similarity and _ai_rationale to each company object.
             Uses cache + ThreadPoolExecutor + per-call fallback.
+            This version ensures we process all items by materializing to list and batching.
             """
-            # collect comps that need remote calls
-            pending = []
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                for comp in items:
-                    comp._ai_similarity = None
-                    comp._ai_rationale = None
+            # Materialize to list to avoid lazy-QuerySet partial iteration issues
+            items_list = list(items)
+            if not items_list:
+                return
 
-                    # determine cache key: prefer stable ID if present
-                    key_id = getattr(comp, "id", None) or (comp.business_description or "")
-                    ck = _cache_key_for_compare(str(key_id), compare_desc)
-                    cached = cache.get(ck) if compare_desc else None
-                    if cached is not None:
-                        comp._ai_similarity = cached.get("similarity")
-                        comp._ai_rationale = cached.get("rationale")
-                        continue
+            # tuning knobs
+            BATCH_SIZE = 100         # process this many companies per thread-batch (tuneable)
+            MAX_WORKERS = 6          # threads per batch
+            PER_FUTURE_TIMEOUT = 10  # seconds per model call
+            CACHE_TTL = 60 * 60 * 6  # 6 hours
 
-                    # schedule a call if compare_desc provided
-                    if compare_desc:
-                        # submit async call
-                        future = ex.submit(_safe_call_openai_compare, comp.business_description or "", compare_desc)
-                        pending.append((comp, future, ck))
+            def _safe_call(company_desc, compare_desc):
+                try:
+                    out = call_openai_compare(company_desc, compare_desc)
+                    if not isinstance(out, dict):
+                        return None
+                    return {"similarity": out.get("similarity"), "rationale": out.get("rationale")}
+                except Exception:
+                    return None
 
-                # gather results
-                for comp, fut, ck in pending:
-                    try:
-                        res = fut.result(timeout=PER_FUTURE_TIMEOUT)
-                    except Exception:
-                        res = None
+            compare_desc_local = compare_desc  # from outer scope in list(); safe capture
 
-                    if res:
-                        comp._ai_similarity = res.get("similarity")
-                        comp._ai_rationale = res.get("rationale")
-                        try:
-                            cache.set(ck, {"similarity": comp._ai_similarity, "rationale": comp._ai_rationale}, CACHE_TTL)
-                        except Exception:
-                            # ignore cache failures; don't break main flow
-                            pass
-                    else:
+            # process in batches
+            for i in range(0, len(items_list), BATCH_SIZE):
+                batch = items_list[i:i + BATCH_SIZE]
+                pending = []
+
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                    # first check cache for each comp and schedule only those missing
+                    for comp in batch:
                         comp._ai_similarity = None
                         comp._ai_rationale = None
+
+                        key_id = getattr(comp, "id", None) or (comp.business_description or "")
+                        ck = _cache_key_for_compare(str(key_id), compare_desc_local)
+                        cached = cache.get(ck) if compare_desc_local else None
+                        if cached is not None:
+                            comp._ai_similarity = cached.get("similarity")
+                            comp._ai_rationale = cached.get("rationale")
+                            continue
+
+                        # schedule call
+                        future = ex.submit(_safe_call, comp.business_description or "", compare_desc_local)
+                        pending.append((comp, future, ck))
+
+                    # collect results for this batch
+                    for comp, fut, ck in pending:
+                        try:
+                            res = fut.result(timeout=PER_FUTURE_TIMEOUT)
+                        except Exception:
+                            res = None
+
+                        if res:
+                            comp._ai_similarity = res.get("similarity")
+                            comp._ai_rationale = res.get("rationale")
+                            try:
+                                cache.set(ck, {"similarity": comp._ai_similarity, "rationale": comp._ai_rationale}, CACHE_TTL)
+                            except Exception:
+                                pass
+                        else:
+                            comp._ai_similarity = None
+                            comp._ai_rationale = None
 
         if page is not None:
             # attach latest record reference for serializer
