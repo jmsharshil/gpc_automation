@@ -527,12 +527,50 @@ class CompanyListAPIView(generics.ListAPIView):
                 sub = Q(**{f"{field}__icontains": w})
                 q = sub if q is None else (q & sub)
             return q
+        
+        def _same_sentence_q_for_words(field, words):
+            """
+            Return a Q object that matches all `words` appearing in the same sentence.
+            Uses a Postgres-friendly case-insensitive regex when connection.vendor == 'postgresql'.
+            Falls back to chaining icontains conditions for other DB backends.
+            """
+            # defensive: escape words for regex
+            escaped = [re.escape(w) for w in words if w]
+            if not escaped:
+                return None
+
+            if connection.vendor == 'postgresql':
+                # Build a regex that requires words appear in order in the same sentence
+                # (no sentence terminator [.!?] appears between them).
+                # Example for words ['Fleet','Management']:
+                #   r'(?i)\bFleet\b(?:(?![.!?]).)*\bManagement\b'
+                parts = []
+                for w in escaped:
+                    if not parts:
+                        parts.append(r'\b' + w + r'\b')
+                    else:
+                        # allow any chars except sentence terminators between words
+                        parts.append(r'(?:(?![.!?]).)*\b' + w + r'\b')
+                pattern = r'(?i)' + ''.join(parts)
+                return Q(**{f"{field}__iregex": pattern})
+            else:
+                # Fallback: chain icontains so words all must exist somewhere (SQLite behaviour)
+                q = None
+                for w in words:
+                    sub = Q(**{f"{field}__icontains": w})
+                    q = sub if q is None else (q & sub)
+                return q
 
         def _add_group_from_raw(raw_val, combine_with_prev=None):
             if ',' not in raw_val and ';' not in raw_val and '|' not in raw_val and ' ' in raw_val:
                 words = [w.strip() for w in re.split(r'\s+', raw_val) if w.strip()]
                 if words:
-                    q_loose = _stem_prefilter_q_for_words('business_description', words)
+                    if connection.vendor == 'postgresql':
+                        q_regex = _same_sentence_q_for_words('business_description', words)
+                        q_stem = _stem_prefilter_q_for_words('business_description', words)  # if available
+                        q_loose = q_regex if q_regex is not None else q_stem
+                    else:
+                        q_loose = _stem_prefilter_q_for_words('business_description', words)
                     group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
                 return
 
@@ -541,7 +579,12 @@ class CompanyListAPIView(generics.ListAPIView):
                 if ' ' in p:
                     words = [w.strip() for w in re.split(r'\s+', p) if w.strip()]
                     if words:
-                        q_loose = _stem_prefilter_q_for_words('business_description', words)
+                        if connection.vendor == 'postgresql':
+                            q_regex = _same_sentence_q_for_words('business_description', words)
+                            q_stem = _stem_prefilter_q_for_words('business_description', words)  # if available
+                            q_loose = q_regex if q_regex is not None else q_stem
+                        else:
+                            q_loose = _stem_prefilter_q_for_words('business_description', words)
                         group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
                 else:
                     group_objects.append({"type": "OTHER", "words": [p], "q": Q(**{'business_description__icontains': p}), "combine_with_prev": combine_with_prev})
