@@ -29,20 +29,15 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from django.core.cache import cache
 import itertools
-import re
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
-import re
 from django.db import connection
-import re
 from nltk.stem.porter import PorterStemmer
 from django.db.models import Q
-import re
 import html
 import unicodedata
-from nltk.stem.porter import PorterStemmer
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
+import math
 
 _stemmer = PorterStemmer()
 
@@ -419,6 +414,204 @@ def _safe_call_openai_compare(company_desc: str, compare_desc: str):
         # You should log exception in production
         return None
 
+def _prefix_for_word(w: str) -> str:
+    """
+    Prefer a morphological stem via Porter; fallback to the 60% rule.
+    Guarantees >=4 chars when possible for precision.
+    """
+    w = (w or "").strip().lower()
+    if not w:
+        return ""
+    stem = _porter_stem(w)
+    # safety: some very short words stem tiny; fall back to heuristic
+    base = stem if len(stem) >= 3 else w
+    plen = max(4, int(math.ceil(len(base) * 0.6)))
+    return base[:plen]
+
+def _db_regex_for_word_variant(prefix: str) -> str:
+    """
+    Postgres regex using word boundaries. Prefix is already a stemmed base.
+    Matches: \m{base}\w*\M
+    """
+    return r"\m" + re.escape(prefix) + r"\w*\M"
+
+def _py_regex_for_word_variant(prefix: str) -> re.Pattern:
+    """
+    Python regex for word variants with word boundaries.
+    """
+    pat = r"\b" + re.escape(prefix) + r"\w*\b"
+    return re.compile(pat, flags=re.IGNORECASE)
+
+def _safe_phrase_prefilter(field: str, words: list[str]) -> Q:
+    """
+    PREFILTER used to narrow queryset before precise same-sentence check.
+    - On Postgres: AND-chain of iregex on variant-friendly prefixes.
+    - On other DBs: AND-chain of icontains on the prefix (best-effort).
+    """
+    words = [w for w in (words or []) if w.strip()]
+    if not words:
+        return Q()  # no-op
+
+    if connection.vendor == "postgresql":
+        q = None
+        for w in words:
+            prefix = _prefix_for_word(w)
+            if not prefix:
+                continue
+            pattern = _db_regex_for_word_variant(prefix)
+            sub = Q(**{f"{field}__iregex": pattern})
+            q = sub if q is None else (q & sub)
+        return q or Q()
+    else:
+        # Best-effort portable fallback: AND across prefix icontains
+        q = None
+        for w in words:
+            prefix = _prefix_for_word(w)
+            if not prefix:
+                continue
+            sub = Q(**{f"{field}__icontains": prefix})
+            q = sub if q is None else (q & sub)
+        return q or Q()
+
+def _sentence_matches_phrase_fuzzy(text: str, words: list[str]) -> bool:
+    if not text or not words:
+        return False
+
+    # Normalize once for robust matching across unicode/nbsp/entities
+    text = _normalize_text_for_matching(text)
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[\.\!\?\u2026])\s+', text)
+
+    # Compile once per word (stem-aware prefix)
+    regexes = []
+    for w in words:
+        prefix = _prefix_for_word(w)
+        if not prefix:
+            return False
+        regexes.append(_py_regex_for_word_variant(prefix))
+
+    for sent in sentences:
+        if all(rgx.search(sent) for rgx in regexes):
+            return True
+    return False
+
+_vowels = set("aeiou")
+
+def _is_consonant(word, i):
+    ch = word[i]
+    if ch in _vowels: 
+        return False
+    if ch == 'y':
+        return i == 0 or not _is_consonant(word, i-1)
+    return True
+
+def _m(word):
+    # measure of VC sequences
+    m = 0; i = 0; L = len(word)
+    while i < L:
+        while i < L and _is_consonant(word, i): i += 1
+        if i >= L: break
+        while i < L and not _is_consonant(word, i): i += 1
+        m += 1
+    return m
+
+def _vowel_in_stem(word):
+    return any(not _is_consonant(word, i) for i in range(len(word)))
+
+def _ends(word, sfx):
+    return word.endswith(sfx)
+
+def _setto(word, sfx):
+    return word[: -len(sfx[0])] + sfx[1]
+
+def _cvc(word):
+    if len(word) < 3: return False
+    c1 = _is_consonant(word, -1)
+    v  = not _is_consonant(word, -2)
+    c2 = _is_consonant(word, -3)
+    if not (c2 and v and c1): return False
+    return word[-1] not in "wxy"
+
+def _step1ab(w):
+    # Step 1a
+    if _ends(w, "sses"): w = w[:-2]        # sses -> ss
+    elif _ends(w, "ies"): w = w[:-2]       # ies -> i
+    elif _ends(w, "ss"): pass              # ss -> ss
+    elif _ends(w, "s"): w = w[:-1]         # s -> ""
+    # Step 1b
+    flag = False
+    if _ends(w, "eed"):
+        if _m(w[:-3]) > 0:
+            w = w[:-1]  # eed -> ee
+    elif (_ends(w, "ed") and _vowel_in_stem(w[:-2])):
+        w = w[:-2]; flag = True
+    elif (_ends(w, "ing") and _vowel_in_stem(w[:-3])):
+        w = w[:-3]; flag = True
+    if flag:
+        if _ends(w, "at") or _ends(w, "bl") or _ends(w, "iz"):
+            w += "e"
+        elif len(w) >= 2 and w[-1] == w[-2] and w[-1] not in "lsz":
+            w = w[:-1]
+        elif _m(w) == 1 and _cvc(w):
+            w += "e"
+    return w
+
+def _step1c(w):
+    if _ends(w, "y") and _vowel_in_stem(w[:-1]):
+        return w[:-1] + "i"
+    return w
+
+def _step2(w):
+    reps = {
+        "ational":"ate","tional":"tion","enci":"ence","anci":"ance","izer":"ize",
+        "abli":"able","alli":"al","entli":"ent","eli":"e","ousli":"ous","ization":"ize",
+        "ation":"ate","ator":"ate","alism":"al","iveness":"ive","fulness":"ful","ousness":"ous",
+        "aliti":"al","iviti":"ive","biliti":"ble","logi":"log"
+    }
+    for k,v in reps.items():
+        if _ends(w, k) and _m(w[:-len(k)])>0:
+            return w[:-len(k)]+v
+    return w
+
+def _step3(w):
+    reps = {
+        "icate":"ic","ative":"","alize":"al","iciti":"ic","ical":"ic","ful":"","ness":""
+    }
+    for k,v in reps.items():
+        if _ends(w, k) and _m(w[:-len(k)])>0:
+            return w[:-len(k)]+v
+    return w
+
+def _step4(w):
+    sfxes = ["al","ance","ence","er","ic","able","ible","ant","ement","ment","ent",
+             "sion","tion","ou","ism","ate","iti","ous","ive","ize"]
+    for k in sfxes:
+        if _ends(w, k):
+            base = w[:-len(k)]
+            if (k in ("sion","tion") and _m(base)>1) or (k not in ("sion","tion") and _m(base)>1):
+                return base
+    return w
+
+def _step5(w):
+    if _ends(w, "e"):
+        base = w[:-1]
+        if _m(base)>1 or (_m(base)==1 and not _cvc(base)):
+            w = base
+    if _m(w)>1 and _ends(w, "ll"):
+        w = w[:-1]
+    return w
+
+def _porter_stem(word: str) -> str:
+    w = (word or "").strip().lower()
+    if len(w) <= 2: return w
+    w = _step1ab(w)
+    w = _step1c(w)
+    w = _step2(w)
+    w = _step3(w)
+    w = _step4(w)
+    w = _step5(w)
+    return w
 
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200
@@ -527,51 +720,18 @@ class CompanyListAPIView(generics.ListAPIView):
                 sub = Q(**{f"{field}__icontains": w})
                 q = sub if q is None else (q & sub)
             return q
-        
-        def _same_sentence_q_for_words(field, words):
-            """
-            Return a Q object that matches all `words` appearing in the same sentence.
-            Uses a Postgres-friendly case-insensitive regex when connection.vendor == 'postgresql'.
-            Falls back to chaining icontains conditions for other DB backends.
-            """
-            # defensive: escape words for regex
-            escaped = [re.escape(w) for w in words if w]
-            if not escaped:
-                return None
-
-            if connection.vendor == 'postgresql':
-                # Build a regex that requires words appear in order in the same sentence
-                # (no sentence terminator [.!?] appears between them).
-                # Example for words ['Fleet','Management']:
-                #   r'(?i)\bFleet\b(?:(?![.!?]).)*\bManagement\b'
-                parts = []
-                for w in escaped:
-                    if not parts:
-                        parts.append(r'\b' + w + r'\b')
-                    else:
-                        # allow any chars except sentence terminators between words
-                        parts.append(r'(?:(?![.!?]).)*\b' + w + r'\b')
-                pattern = r'(?i)' + ''.join(parts)
-                return Q(**{f"{field}__iregex": pattern})
-            else:
-                # Fallback: chain icontains so words all must exist somewhere (SQLite behaviour)
-                q = None
-                for w in words:
-                    sub = Q(**{f"{field}__icontains": w})
-                    q = sub if q is None else (q & sub)
-                return q
 
         def _add_group_from_raw(raw_val, combine_with_prev=None):
-            if ',' not in raw_val and ';' not in raw_val and '|' not in raw_val and ' ' in raw_val:
+            if ' ' in raw_val and ',' not in raw_val and ';' not in raw_val and '|' not in raw_val:
                 words = [w.strip() for w in re.split(r'\s+', raw_val) if w.strip()]
                 if words:
-                    if connection.vendor == 'postgresql':
-                        q_regex = _same_sentence_q_for_words('business_description', words)
-                        q_stem = _stem_prefilter_q_for_words('business_description', words)  # if available
-                        q_loose = q_regex if q_regex is not None else q_stem
-                    else:
-                        q_loose = _stem_prefilter_q_for_words('business_description', words)
-                    group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
+                    q_loose = _safe_phrase_prefilter('business_description', words)
+                    group_objects.append({
+                        "type": "SAME_SENTENCE",
+                        "words": words,
+                        "q": q_loose,
+                        "combine_with_prev": combine_with_prev
+                    })
                 return
 
             parts = [p.strip() for p in re.split(r'[;,|]+', raw_val) if p.strip()]
@@ -579,15 +739,20 @@ class CompanyListAPIView(generics.ListAPIView):
                 if ' ' in p:
                     words = [w.strip() for w in re.split(r'\s+', p) if w.strip()]
                     if words:
-                        if connection.vendor == 'postgresql':
-                            q_regex = _same_sentence_q_for_words('business_description', words)
-                            q_stem = _stem_prefilter_q_for_words('business_description', words)  # if available
-                            q_loose = q_regex if q_regex is not None else q_stem
-                        else:
-                            q_loose = _stem_prefilter_q_for_words('business_description', words)
-                        group_objects.append({"type": "SAME_SENTENCE", "words": words, "q": q_loose, "combine_with_prev": combine_with_prev})
+                        q_loose = _safe_phrase_prefilter('business_description', words)
+                        group_objects.append({
+                            "type": "SAME_SENTENCE",
+                            "words": words,
+                            "q": q_loose,
+                            "combine_with_prev": combine_with_prev
+                        })
                 else:
-                    group_objects.append({"type": "OTHER", "words": [p], "q": Q(**{'business_description__icontains': p}), "combine_with_prev": combine_with_prev})
+                    group_objects.append({
+                        "type": "OTHER",
+                        "words": [p],
+                        "q": Q(**{'business_description__icontains': p}),
+                        "combine_with_prev": combine_with_prev
+                    })
 
         kw_cond_list = [c.strip().upper() for c in self.request.GET.getlist('keyword_condition') if c.strip()]
         if not kw_cond_list:
@@ -699,7 +864,7 @@ class CompanyListAPIView(generics.ListAPIView):
                     for comp in candidate_qs.only('id', 'business_description'):
                         desc = comp.business_description or ""
                         for g_idx, g in enumerate(same_sentence_groups):
-                            if _sentence_matches_phrase(desc, g['words']):
+                            if _sentence_matches_phrase_fuzzy(desc, g['words']):
                                 if len(same_group_id_sets) <= g_idx:
                                     while len(same_group_id_sets) <= g_idx:
                                         same_group_id_sets.append(set())
