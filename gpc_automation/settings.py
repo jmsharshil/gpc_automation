@@ -28,7 +28,7 @@ SECRET_KEY = 'django-insecure-d!-t&!5j1u7r+6gt938@r-y8mdz=fttnhs$!r^hrjwdvf9aht6
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ['gpcautomation.s3-website.ap-south-1.amazonaws.com','localhost','127.0.0.1','gpc-h0eth6gagwh3f3ad.centralindia-01.azurewebsites.net']
+ALLOWED_HOSTS = ['gpcauto.s3-website.ap-south-1.amazonaws.com','gpcautomation.s3-website.ap-south-1.amazonaws.com','localhost','127.0.0.1','gpc-h0eth6gagwh3f3ad.centralindia-01.azurewebsites.net']
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # choose a model you have access to
@@ -122,12 +122,22 @@ if not DEBUG:
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 if DEBUG:
+    # DATABASES = {
+    #     'default': {
+    #         'ENGINE': 'django.db.backends.sqlite3',
+    #         'NAME': BASE_DIR / 'db.sqlite3',
+    #     }
+    # }
     DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'gpc',          # Replace with your database name
+        'USER': 'postgres',          # Replace with your database user
+        'PASSWORD': 'admin',  # Replace with your database password
+        'HOST': 'localhost',             # Use 'localhost' for local development or the IP of your DB server
+        'PORT': '5432',                  # Default PostgreSQL port
     }
+}
 
 else:
     CONNECTION_STRING = os.environ['AZURE_POSTGRESQL_CONNECTIONSTRING']
@@ -200,6 +210,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost",
     "http://gpcautomation.s3-website.ap-south-1.amazonaws.com",
+    'http://gpcauto.s3-website.ap-south-1.amazonaws.com/',
     # Add your frontend URLs
 ]
 
@@ -214,3 +225,6 @@ MICROSOFT_OAUTH_REDIRECT_URI = os.environ.get('MICROSOFT_OAUTH_REDIRECT_URI', 'h
 MICROSOFT_OAUTH_AUTHORIZE_URL = f'https://login.microsoftonline.com/{MICROSOFT_OAUTH_TENANT_ID}/oauth2/v2.0/authorize'
 MICROSOFT_OAUTH_TOKEN_URL = f'https://login.microsoftonline.com/{MICROSOFT_OAUTH_TENANT_ID}/oauth2/v2.0/token'
 MICROSOFT_GRAPH_USER_URL = 'https://graph.microsoft.com/v1.0/me'
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
