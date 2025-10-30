@@ -210,6 +210,36 @@ def _get_decimal(value):
     except (InvalidOperation, ValueError):
         return None
 
+def _db_regex_for_exact_phrase(phrase: str) -> str:
+    """
+    Postgres regex for an exact, whole-word phrase match.
+    Uses \m ... \M word boundaries around the full phrase.
+    """
+    # Normalize like we do for text, but only collapse spaces; keep letters as-is
+    norm = _normalize_text_for_matching(phrase)
+    # Escape phrase for regex; allow single spaces only (since we collapsed)
+    return r"\m" + re.escape(norm) + r"\M"
+
+def _py_regex_for_exact_phrase(phrase: str) -> re.Pattern:
+    """
+    Python regex for an exact, whole-word phrase match (case-insensitive).
+    """
+    norm = _normalize_text_for_matching(phrase)
+    # \b around the entire phrase to enforce whole-word boundaries on both ends
+    pat = r"\b" + re.escape(norm) + r"\b"
+    return re.compile(pat, flags=re.IGNORECASE)
+
+def _text_contains_exact_phrase(text: str, phrase: str) -> bool:
+    """
+    Exact phrase anywhere in the text (not sentence-scoped).
+    Word boundaries enforced on both ends, case-insensitive.
+    """
+    if not text or not phrase:
+        return False
+    text_n = _normalize_text_for_matching(text)
+    rgx = _py_regex_for_exact_phrase(phrase)
+    return bool(rgx.search(text_n))
+
 # helper to build a Q for a list of terms with AND/OR between those terms
 def _build_q_for_terms(terms, condition='OR', field='business_description'):
     """
@@ -614,7 +644,7 @@ def _porter_stem(word: str) -> str:
     return w
 
 class StandardResultsSetPagination(PageNumberPagination):
-    page_size = 300
+    page_size = 200
     page_size_query_param = 'page_size'
     max_page_size = 500
 
@@ -722,6 +752,30 @@ class CompanyListAPIView(generics.ListAPIView):
             return q
 
         def _add_group_from_raw(raw_val, combine_with_prev=None):
+            raw_val = raw_val.strip()
+            if not raw_val:
+                return
+
+            # NEW: detect a single, double-quoted phrase => EXACT_PHRASE group
+            # Accept " phrase " with surrounding quotes only if both ends are quoted
+            if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] == '"':
+                phrase = raw_val[1:-1].strip()
+                if phrase:
+                    # Prefilter: quick icontains (works on any DB); on Postgres prefer word-boundary regex
+                    if connection.vendor == "postgresql":
+                        pattern = _db_regex_for_exact_phrase(phrase)
+                        q_pref = Q(**{'business_description__iregex': pattern})
+                    else:
+                        q_pref = Q(**{'business_description__icontains': phrase})
+                    group_objects.append({
+                        "type": "EXACT_PHRASE",
+                        "phrase": phrase,
+                        "q": q_pref,
+                        "combine_with_prev": combine_with_prev
+                    })
+                return
+
+            # If it's a single space-delimited phrase (no list separators), treat as SAME_SENTENCE fuzzy group
             if ' ' in raw_val and ',' not in raw_val and ';' not in raw_val and '|' not in raw_val:
                 words = [w.strip() for w in re.split(r'\s+', raw_val) if w.strip()]
                 if words:
@@ -734,9 +788,24 @@ class CompanyListAPIView(generics.ListAPIView):
                     })
                 return
 
+            # Otherwise it might be a CSV/semicolon/pipe list; split and handle individually
             parts = [p.strip() for p in re.split(r'[;,|]+', raw_val) if p.strip()]
             for p in parts:
-                if ' ' in p:
+                if len(p) >= 2 and p[0] == p[-1] == '"':
+                    phrase = p[1:-1].strip()
+                    if phrase:
+                        if connection.vendor == "postgresql":
+                            pattern = _db_regex_for_exact_phrase(phrase)
+                            q_pref = Q(**{'business_description__iregex': pattern})
+                        else:
+                            q_pref = Q(**{'business_description__icontains': phrase})
+                        group_objects.append({
+                            "type": "EXACT_PHRASE",
+                            "phrase": phrase,
+                            "q": q_pref,
+                            "combine_with_prev": combine_with_prev
+                        })
+                elif ' ' in p:
                     words = [w.strip() for w in re.split(r'\s+', p) if w.strip()]
                     if words:
                         q_loose = _safe_phrase_prefilter('business_description', words)
@@ -775,124 +844,80 @@ class CompanyListAPIView(generics.ListAPIView):
                 combine_with_prev = cond_part.strip().upper() or None
             else:
                 terms_part = raw_group
-            for chunk in [c.strip() for c in re.split(r'[;,]+', terms_part) if c.strip()]:
+            for chunk in [c.strip() for c in re.split(r'[;,]+', terms_part) if c.strip()] :
                 _add_group_from_raw(chunk, combine_with_prev=combine_with_prev)
 
         if not group_objects:
             legacy = self.request.GET.get('keywords') or self.request.GET.get('keyword')
             if legacy:
-                for chunk in [c.strip() for c in re.split(r'[;,]+', legacy) if c.strip()]:
+                for chunk in [c.strip() for c in re.split(r'[;,]+', legacy) if c.strip()] :
                     _add_group_from_raw(chunk, combine_with_prev=None)
 
         if not group_objects:
             final_keyword_q = None
         else:
-            # ============================================
-            # KEY OPTIMIZATION: Separate AND and OR groups
-            # Process AND groups FIRST to reduce dataset early
-            # ============================================
+            # Unified pipeline for AND/OR:
+            # 1) Prefilter (OR of all groups' quick DB filters) to shrink candidates
+            prefilter_q = None
+            for g in group_objects:
+                if g.get('q') is None:
+                    continue
+                prefilter_q = g['q'] if prefilter_q is None else (prefilter_q | g['q'])
+
+            candidate_qs = qs_companies.filter(prefilter_q) if prefilter_q is not None else qs_companies
+
+            # 2) Materialize ids for verification groups
+            #    - SAME_SENTENCE: fuzzy same-sentence word presence (existing behavior) — used for AND *and* OR
+            #    - EXACT_PHRASE: strict whole-phrase match (no stemming) — used for AND *and* OR
+            same_sentence_groups = []
+            exact_phrase_groups = []
+            for g in group_objects:
+                if g['type'] == 'SAME_SENTENCE':
+                    same_sentence_groups.append(g)
+                    g['_index'] = len(same_sentence_groups) - 1  # record index
+                elif g['type'] == 'EXACT_PHRASE':
+                    exact_phrase_groups.append(g)
+                    g['_index'] = len(exact_phrase_groups) - 1
+
+            same_id_sets = [set() for _ in same_sentence_groups] if same_sentence_groups else []
+            exact_id_sets = [set() for _ in exact_phrase_groups] if exact_phrase_groups else []
+
+            if same_sentence_groups or exact_phrase_groups:
+                for comp in candidate_qs.only('id', 'business_description'):
+                    desc = comp.business_description or ""
+                    # SAME_SENTENCE verification
+                    for i, g in enumerate(same_sentence_groups):
+                        if _sentence_matches_phrase_fuzzy(desc, g['words']):
+                            same_id_sets[i].add(comp.id)
+                    # EXACT_PHRASE verification
+                    for i, g in enumerate(exact_phrase_groups):
+                        if _text_contains_exact_phrase(desc, g['phrase']):
+                            exact_id_sets[i].add(comp.id)
+
+            # 3) Build final Q by combining groups in order, honoring AND/OR
             global_group_operator = (self.request.GET.get('group_operator') or 'OR').strip().upper()
-            
-            # Identify if we have AND conditions
-            has_and_conditions = any(
-                (g.get('combine_with_prev') == 'AND' or 
-                (g.get('combine_with_prev') is None and global_group_operator == 'AND'))
-                for g in group_objects
-            )
-            
-            if has_and_conditions:
-                # OPTIMIZATION 1: Apply filters progressively for AND conditions
-                # This reduces the dataset size early, making subsequent filters faster
-                
-                temp_qs = qs_companies
-                final_keyword_q = None
-                
-                for g_idx, g in enumerate(group_objects):
+            final_keyword_q = None
+            for g in group_objects:
+                if g['type'] == 'SAME_SENTENCE':
+                    ids = same_id_sets[g['_index']] if same_id_sets else set()
+                    q_part = Q(id__in=list(ids)) if ids else Q(id__in=[])
+                elif g['type'] == 'EXACT_PHRASE':
+                    ids = exact_id_sets[g['_index']] if exact_id_sets else set()
+                    q_part = Q(id__in=list(ids)) if ids else Q(id__in=[])
+                else:
+                    q_part = g['q']
+
+                if final_keyword_q is None:
+                    final_keyword_q = q_part
+                else:
                     op = (g.get('combine_with_prev') or global_group_operator or 'OR')
-                    
-                    # For AND conditions, apply filter immediately to reduce dataset
-                    if op == 'AND' or (g_idx == 0 and global_group_operator == 'AND'):
-                        if g['type'] == 'SAME_SENTENCE':
-                            # OPTIMIZATION 2: Chain multiple icontains for phrase matching
-                            # This works reliably across SQLite and PostgreSQL
-                            words = g['words']
-                            for word in words:
-                                temp_qs = temp_qs.filter(business_description__icontains=word)
-                        else:
-                            # Apply simple icontains filter
-                            for word in g['words']:
-                                temp_qs = temp_qs.filter(business_description__icontains=word)
+                    if op == 'AND':
+                        final_keyword_q &= q_part
                     else:
-                        # For OR conditions, build Q object as before
-                        if g['type'] == 'SAME_SENTENCE':
-                            # Chain multiple icontains for phrase matching (works across all databases)
-                            words = g['words']
-                            q_part = Q()
-                            for word in words:
-                                q_part &= Q(business_description__icontains=word)
-                        else:
-                            q_part = g['q']
-                        
-                        if final_keyword_q is None:
-                            final_keyword_q = q_part
-                        else:
-                            final_keyword_q |= q_part
-                
-                # Apply any remaining OR conditions
-                if final_keyword_q is not None:
-                    temp_qs = temp_qs.filter(final_keyword_q)
-                
-                qs_companies = temp_qs
-            
-            else:
-                # ORIGINAL LOGIC: For OR-only conditions (already fast)
-                # Build prefilter
-                prefilter_q = None
-                for g in group_objects:
-                    if g.get('q') is None:
-                        continue
-                    prefilter_q = g['q'] if prefilter_q is None else (prefilter_q | g['q'])
+                        final_keyword_q |= q_part
 
-                candidate_qs = qs_companies.filter(prefilter_q) if prefilter_q is not None else qs_companies
-
-                # SAME_SENTENCE groups: precise verification
-                same_sentence_groups = [g for g in group_objects if g['type'] == 'SAME_SENTENCE']
-                same_group_id_sets = []
-                
-                if same_sentence_groups:
-                    # OPTIMIZATION 3: Limit fields loaded into memory
-                    for comp in candidate_qs.only('id', 'business_description'):
-                        desc = comp.business_description or ""
-                        for g_idx, g in enumerate(same_sentence_groups):
-                            if _sentence_matches_phrase_fuzzy(desc, g['words']):
-                                if len(same_group_id_sets) <= g_idx:
-                                    while len(same_group_id_sets) <= g_idx:
-                                        same_group_id_sets.append(set())
-                                same_group_id_sets[g_idx].add(comp.id)
-
-                # Build final Q
-                final_keyword_q = None
-                ss_index = 0
-                
-                for g in group_objects:
-                    if g['type'] == 'SAME_SENTENCE':
-                        ids = same_group_id_sets[ss_index] if ss_index < len(same_group_id_sets) else set()
-                        ss_index += 1
-                        q_part = Q(id__in=list(ids)) if ids else Q(id__in=[])
-                    else:
-                        q_part = g['q']
-
-                    if final_keyword_q is None:
-                        final_keyword_q = q_part
-                    else:
-                        op = (g.get('combine_with_prev') or global_group_operator or 'OR')
-                        if op == 'AND':
-                            final_keyword_q &= q_part
-                        else:
-                            final_keyword_q |= q_part
-
-                if final_keyword_q is not None:
-                    qs_companies = qs_companies.filter(final_keyword_q)
+            if final_keyword_q is not None:
+                qs_companies = qs_companies.filter(final_keyword_q)
 
         return qs_companies
 
