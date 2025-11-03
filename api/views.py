@@ -14,7 +14,6 @@ from .models import Company, FinancialRecord
 from .serializers import DashboardSummarySerializer, CompanySerializer, FinancialRecordSerializer, CompareRequestSerializer
 from .utils_master_sheet import process_master_screening_v2
 import re
-from django.db.models import Q
 import openai
 from django.conf import settings
 from .utils.openai_helpers import call_openai_compare
@@ -38,6 +37,7 @@ import unicodedata
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 import math
+import datetime
 
 _stemmer = PorterStemmer()
 
@@ -194,13 +194,13 @@ class IndustryListAPIView(APIView):
 #     page_size_query_param = 'page_size'
 #     max_page_size = 500
 
-def _get_decimal(value):
-    if value is None or value == '':
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
+# def _get_decimal(value):
+#     if value is None or value == '':
+#         return None
+#     try:
+#         return Decimal(str(value))
+#     except (InvalidOperation, ValueError):
+#         return None
 
 def _get_decimal(value):
     if value is None or value == '':
@@ -643,6 +643,50 @@ def _porter_stem(word: str) -> str:
     w = _step5(w)
     return w
 
+def _get_date(raw):
+    """
+    Return datetime.date or None.
+    Accepts:
+      - '08-03-2000', '08/03/2000' (day-first),
+      - '2000-03-08',
+      - Excel serial numbers (int/float),
+      - pandas-friendly strings if pandas present.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    # Excel serial numbers
+    try:
+        # int-like or float-like
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            val = float(s)
+            if not math.isnan(val):
+                base = datetime.date(1899, 12, 30)  # Windows base (handles 1900 bug)
+                return base + datetime.timedelta(days=int(val))
+    except Exception:
+        pass
+
+    # Try pandas if available (handles many cases); parse as day-first
+    try:
+        import pandas as pd
+        ts = pd.to_datetime(s, dayfirst=True, errors='coerce')
+        if pd.notna(ts):
+            return ts.date()
+    except Exception:
+        pass
+
+    # Common explicit fallbacks
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+
+    return None
+
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200
     page_size_query_param = 'page_size'
@@ -681,6 +725,13 @@ class CompanyListAPIView(generics.ListAPIView):
             qs_companies = qs_companies.filter(primary_sector__icontains=primary_sector)
         if primary_industry:
             qs_companies = qs_companies.filter(primary_industry__icontains=primary_industry)
+
+        fpd_min = _get_date(self.request.GET.get('first_pricing_date_min'))
+        fpd_max = _get_date(self.request.GET.get('first_pricing_date_max'))
+        if fpd_min is not None:
+            qs_companies = qs_companies.filter(first_pricing_date__gte=fpd_min)
+        if fpd_max is not None:
+            qs_companies = qs_companies.filter(first_pricing_date__lte=fpd_max)
 
         # Financial filters target the 'latest' period
         fr_q = Q(period='latest')

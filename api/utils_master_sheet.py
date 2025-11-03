@@ -9,6 +9,8 @@ from django.conf import settings
 
 from .models import Company, FinancialRecord
 from api.models import UploadJob  # adjust import if UploadJob lives elsewhere
+import datetime
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,66 @@ def _fr_values_equal(fr_obj, defaults):
             return False
     return True
 
+def _parse_date(val):
+    """
+    Safely parse date from:
+      - string like '08-03-2000' or '08/03/2000' (day-first)
+      - pandas Timestamp / datetime.date / datetime.datetime
+      - Excel serial numbers (e.g., 37653)  -> Windows base (1899-12-30)
+      - blanks / NA -> None
+    Returns datetime.date or None.
+    """
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    # pandas NA
+    try:
+        import pandas as pd
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    # datetime / date
+    if isinstance(val, datetime.datetime):
+        return val.date()
+    if isinstance(val, datetime.date):
+        return val
+
+    # Excel serial numbers (int/float)
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        # Excel for Windows uses 1899-12-30 as day 0 (handling the 1900 leap bug)
+        try:
+            base = datetime.date(1899, 12, 30)
+            serial_days = int(val)
+            return base + datetime.timedelta(days=serial_days)
+        except Exception:
+            pass
+
+    # Strings
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.lower() in EMPTY_TOKENS:
+        return None
+
+    # Try pandas day-first parse (handles '08-03-2000' as 08 March 2000)
+    try:
+        import pandas as pd
+        ts = pd.to_datetime(s, dayfirst=True, errors='coerce')
+        if pd.notna(ts):
+            # ts may be Timestamp or NaT
+            return ts.date()
+    except Exception:
+        pass
+
+    # Fallback: try datetime.strptime with a couple of common patterns
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+
+    return None
 
 def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_by=None, save_file_to_job=False):
     """
@@ -139,6 +201,10 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                 enterprise_value = _parse_decimal(row.get("Total Enterprise Value [My Setting] [Latest] ($USDmm, Historical rate)"))
                 ebitda = _parse_decimal(row.get("EBITDA [LTM] ($USDmm, Historical rate)"))
                 ev_revenu = _parse_decimal(row.get("EV/ Revenu"))
+                
+                # NEW: read/parse first pricing date
+                first_pricing_date_raw = row.get("First Pricing Date")
+                first_pricing_date = _parse_date(first_pricing_date_raw)
 
                 # Truncate strings so DB won't reject them
                 truncated_fields = {}
@@ -189,7 +255,8 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                                 website=website,
                                 business_description=business_description,
                                 industry_classifications=industry_classifications,
-                                country=country
+                                country=country,
+                                first_pricing_date=first_pricing_date,
                             )
                             created_companies += 1
                         except DataError as e:
@@ -215,6 +282,7 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                         set_if_present('business_description', business_description)
                         set_if_present('industry_classifications', industry_classifications)
                         set_if_present('country', country)
+                        set_if_present('first_pricing_date', first_pricing_date)
                         if updated_fields:
                             try:
                                 company.save(update_fields=updated_fields)

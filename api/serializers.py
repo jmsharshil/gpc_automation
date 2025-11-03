@@ -39,7 +39,7 @@ class CompanySerializer(serializers.ModelSerializer):
             'exchange_ticker', 'primary_sector', 'primary_industry',
             'headquarters_country_region', 'website', 'business_description',
             'industry_classifications', 'country','latest_financial',
-            'records'
+            'records', 'first_pricing_date'
         ]
         read_only_fields = [
             'id', 'records'
