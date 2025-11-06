@@ -2,28 +2,30 @@ from rest_framework import serializers
 from .models import Chat, Message, UserOpenAISetting
 
 
-
-
 class MessageSerializer(serializers.ModelSerializer):
+    attachment_url = serializers.SerializerMethodField()
     class Meta:
         model = Message
-        fields = ('id', 'chat', 'role', 'content', 'tokens', 'openai_response_id', 'created_at', 'metadata')
-        read_only_fields = ('id', 'tokens', 'openai_response_id', 'created_at', 'metadata')
+        fields = ('id', 'chat', 'role', 'content', 'tokens', 'openai_response_id', 'created_at', 'metadata','attachment', 'attachment_name', 'attachment_content_type', 'attachment_url')
+        read_only_fields = ('id', 'tokens', 'openai_response_id', 'created_at', 'metadata', 'attachment_url')
+        extra_kwargs = {
+            'attachment': {'write_only': True, 'required': False}
+        }
 
-
-
+    def get_attachment_url(self, obj):
+        request = self.context.get('request')
+        if obj.attachment and hasattr(obj.attachment, 'url'):
+            url = obj.attachment.url  # Azure URL or SAS URL in prod; /media/... in dev
+            return request.build_absolute_uri(url) if request else url
+        return None
 
 class ChatSerializer(serializers.ModelSerializer):
     messages = MessageSerializer(many=True, read_only=True)
-
 
     class Meta:
         model = Chat
         fields = ('id', 'owner', 'title', 'system_prompt', 'created_at', 'updated_at', 'messages')
         read_only_fields = ('id', 'owner', 'created_at', 'updated_at')
-
-
-
 
 class UserOpenAISettingSerializer(serializers.ModelSerializer):
     class Meta:

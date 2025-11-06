@@ -2,9 +2,6 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
-
-
-
 class Chat(models.Model):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="chats")
     title = models.CharField(max_length=255, blank=True)
@@ -18,8 +15,6 @@ class Chat(models.Model):
         return self.title or f"Chat {self.pk}"
 
 
-
-
 class Message(models.Model):
     ROLE_CHOICES = (("system", "system"), ("user", "user"), ("assistant", "assistant"))
     chat = models.ForeignKey(Chat, on_delete=models.CASCADE, related_name="messages")
@@ -29,12 +24,14 @@ class Message(models.Model):
     openai_response_id = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     metadata = models.JSONField(default=dict, blank=True)
+    
+    attachment = models.FileField(upload_to='chat_attachments/%Y/%m/%d/', null=True, blank=True)
+    attachment_name = models.CharField(max_length=512, blank=True)
+    attachment_content_type = models.CharField(max_length=255, blank=True)
 
 
     class Meta:
         ordering = ["created_at"]
-
-
 
 
 class UserOpenAISetting(models.Model):

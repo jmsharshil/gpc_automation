@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'user_auth',
     'api',
     'crm_chat',
+    'storages',
 ]
 
 REST_FRAMEWORK = {
@@ -228,3 +229,28 @@ MICROSOFT_GRAPH_USER_URL = 'https://graph.microsoft.com/v1.0/me'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+USE_AZURE_MEDIA = os.environ.get("USE_AZURE_MEDIA", "0") in ("1", "true", "True")
+
+if USE_AZURE_MEDIA:
+    # Store user uploads (MEDIA) in Azure Blob Storage
+    DEFAULT_FILE_STORAGE = "storages.backends.azure_storage.AzureStorage"
+
+    # Required
+    AZURE_ACCOUNT_NAME = os.environ["AZURE_ACCOUNT_NAME"]
+    AZURE_ACCOUNT_KEY = os.environ["AZURE_ACCOUNT_KEY"]
+    AZURE_CONTAINER = os.environ.get("AZURE_MEDIA_CONTAINER", "media")
+
+    # Optional (recommended)
+    # If the container is PRIVATE, django-storages will generate signed SAS URLs for FieldFile.url
+    AZURE_URL_EXPIRATION_SECS = int(os.environ.get("AZURE_URL_EXPIRATION_SECS", "3600"))
+    AZURE_OVERWRITE_FILES = False
+
+    # Domain used to build file URLs. For public containers this is the blob endpoint, or your CDN hostname.
+    AZURE_CUSTOM_DOMAIN = os.environ.get(
+        "AZURE_CUSTOM_DOMAIN",
+        f"{AZURE_ACCOUNT_NAME}.blob.core.windows.net"
+    )
+
+    # In Azure mode, MEDIA_URL should point at Blob (or CDN) so .url becomes a full https URL.
+    MEDIA_URL = f"https://{AZURE_CUSTOM_DOMAIN}/{AZURE_CONTAINER}/"
