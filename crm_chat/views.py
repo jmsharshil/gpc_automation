@@ -341,10 +341,7 @@ class DeleteChatAPIView(APIView):
         chat_title = chat.title if hasattr(chat, 'title') else f"Chat {chat.pk}"
         chat.delete()
 
-        return Response(
-            {'message': f'{chat_title} deleted successfully.'},
-            status=status.HTTP_204_NO_CONTENT
-        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
         
 # class BulkDeleteChatsAPIView(APIView):
 #     permission_classes = [permissions.IsAuthenticated]
