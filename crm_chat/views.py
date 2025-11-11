@@ -236,13 +236,28 @@ class SendMessageAPIView(APIView):
 
         try:
             client = openai.OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages_payload,
+            # resp = client.chat.completions.create(
+            #     model=model,
+            #     messages=messages_payload,
+            #     temperature=temperature,
+            #     max_tokens=max_tokens,
+            # )
+            # assistant_text = resp.choices[0].message.content
+            from openai import OpenAI
+            client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
+
+            # Convert your messages_payload (list of {role, content}) to Responses API "input"
+            input_items = [{"role": m["role"], "content": m["content"]} for m in messages_payload]
+
+            resp = client.responses.create(
+                model=model or "gpt-4o-mini",
+                input=input_items,
+                tools=[{"type": "web_search"}],              # <-- enables browsing
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_output_tokens=max_tokens                 # name differs from max_tokens in Responses API
             )
-            assistant_text = resp.choices[0].message.content
+
+            assistant_text = resp.output_text
             usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
 
             assistant_msg = Message.objects.create(
