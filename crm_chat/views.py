@@ -18,6 +18,8 @@ from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUpload
 import pandas as pd
 import openpyxl
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from django.db import transaction
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +346,118 @@ def extract_text_from_excel_bytes(file_bytes, filename='file'):
             return ''
      
 
+class EditAndResendAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def patch(self, request, chat_pk, message_pk):
+        user = request.user
+        chat = get_object_or_404(Chat, pk=chat_pk, owner=user)
+
+        # Accept content either from JSON body or query param for convenience
+        new_content = (request.data.get('content') or request.GET.get('content') or '').strip()
+        if not new_content:
+            return Response({'error': 'content is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Try to find the message by id:
+        # Prefer a user message; if it's an assistant message, find the user message immediately before it.
+        try:
+            msg = Message.objects.get(pk=message_pk, chat=chat)
+        except Message.DoesNotExist:
+            return Response({'detail': 'No Message matches the given query.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if msg.role == 'assistant':
+            # find the closest prior user message
+            user_msg = chat.messages.filter(role='user', created_at__lt=msg.created_at).order_by('-created_at').first()
+            if not user_msg:
+                return Response({'detail': 'No preceding user message found for this assistant message.'}, status=status.HTTP_404_NOT_FOUND)
+            msg = user_msg
+        elif msg.role != 'user':
+            return Response({'detail': 'Message must be a user message or an assistant message that follows a user message.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # At this point `msg` is the user message to edit
+        original_content = msg.content or ''
+        with transaction.atomic():
+            meta = msg.metadata or {}
+            meta.setdefault('edits', []).append({
+                'original': original_content,
+                'edited_at': timezone.now().isoformat(),
+                'editor_id': user.id,
+            })
+            msg.content = new_content
+            msg.metadata = meta
+            try:
+                msg.edited = True
+                msg.edited_at = timezone.now()
+            except Exception:
+                pass
+            msg.save()
+
+            # Rebuild messages payload (same logic as your send view)
+            system_prompt = chat.system_prompt or ''
+            messages_payload = []
+            if system_prompt:
+                messages_payload.append({'role': 'system', 'content': system_prompt})
+
+            recent_messages = chat.messages.all().order_by('-created_at')[:20][::-1]
+            for m in recent_messages:
+                content = m.content or ''
+                if m.attachment:
+                    att_note = f"[Attachment: {m.attachment_name} | content-type: {m.attachment_content_type}]"
+                    messages_payload.append({'role': m.role, 'content': (content + "\n\n" + att_note).strip()})
+                else:
+                    messages_payload.append({'role': m.role, 'content': content})
+
+            # Call OpenAI Responses API (same as before)
+            user_setting = getattr(user, 'openai_setting', None)
+            model = request.data.get('model') or (user_setting.default_model if user_setting else 'gpt-4o')
+            try:
+                temperature = float(request.data.get('temperature') or (user_setting.temperature if user_setting else 0.2))
+            except Exception:
+                temperature = 0.2
+            try:
+                max_tokens = int(request.data.get('max_tokens') or (user_setting.max_tokens if user_setting else 1024))
+            except Exception:
+                max_tokens = 1024
+
+            from openai import OpenAI
+            client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
+
+            input_items = [{"role": m["role"], "content": m["content"]} for m in messages_payload]
+            resp = client.responses.create(
+                model=model or "gpt-4o-mini",
+                input=input_items,
+                tools=[{"type": "web_search"}],
+                temperature=temperature,
+                max_output_tokens=max_tokens
+            )
+
+            assistant_text = getattr(resp, 'output_text', '') or ''
+            usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
+
+            # Update assistant message after the user message if exists, else create a new one
+            assistant_msg = chat.messages.filter(role='assistant', created_at__gt=msg.created_at).order_by('created_at').first()
+            if assistant_msg:
+                assistant_msg.content = assistant_text
+                meta = assistant_msg.metadata or {}
+                meta['openai_usage'] = usage
+                meta['replaced_by_edit_of'] = msg.pk
+                assistant_msg.metadata = meta
+                try:
+                    assistant_msg.updated_at = timezone.now()
+                except Exception:
+                    pass
+                assistant_msg.save()
+            else:
+                assistant_msg = Message.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=assistant_text,
+                    metadata={'openai_usage': usage, 'replaced_by_edit_of': msg.pk}
+                )
+
+            serializer = MessageSerializer(assistant_msg, context={'request': request})
+            return Response(serializer.data, status=status.HTTP_200_OK)
 class DeleteChatAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
