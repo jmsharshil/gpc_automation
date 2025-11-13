@@ -16,17 +16,81 @@ import openpyxl
 import logging
 from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
 import pandas as pd
-import openpyxl
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-CHARACTER_LIMIT = 60_000
+CHARACTER_LIMIT = 100_000  # You increased this
 
 openai.api_key = getattr(settings, 'OPENAI_API_KEY', None)
 
+
+# ====================== HELPER: EXTRACT TEXT FROM EXCEL ======================
+def extract_text_from_excel_bytes(file_bytes, filename='file'):
+    import io, pandas as pd, openpyxl
+    parts = []
+
+    try:
+        ext = (filename or '').lower()
+        engine = None
+        if ext.endswith('.xls'):
+            engine = 'xlrd'
+        elif ext.endswith('.xlsb'):
+            engine = 'pyxlsb'
+
+        excel_data = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine=engine)
+        for sheet_name, df in excel_data.items():
+            df_small = df.iloc[:20, :20]
+            header = "\t".join(map(str, df_small.columns))
+            rows = ["\t".join("" if pd.isna(v) else str(v) for v in row) for row in df_small.itertuples(index=False, name=None)]
+            parts.append(f"--- Sheet: {sheet_name} ---\n{header}\n" + ("\n".join(rows) if rows else "(no rows)"))
+        text = "\n\n".join(parts)
+        if len(text) > CHARACTER_LIMIT:
+            text = text[:CHARACTER_LIMIT-3] + '...'
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    try:
+        wb = openpyxl.load_workbook(filename=io.BytesIO(file_bytes), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            lines, max_rows, max_cols = [], 50, 50
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= max_rows: break
+                lines.append("\t".join("" if c is None else str(c) for c in (row[:max_cols])))
+            parts.append(f"--- Sheet: {ws.title} ---\n" + ("\n".join(lines) if lines else "(no rows)"))
+        text = "\n\n".join(parts)
+        if len(text) > CHARACTER_LIMIT:
+            text = text[:CHARACTER_LIMIT-3] + '...'
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), nrows=200)
+        header = "\t".join(map(str, df.columns))
+        rows = ["\t".join("" if pd.isna(v) else str(v) for v in r) for r in df.head(50).itertuples(index=False, name=None)]
+        text = f"--- CSV ---\n{header}\n" + ("\n".join(rows) if rows else "(no rows)")
+        if len(text) > CHARACTER_LIMIT:
+            text = text[:CHARACTER_LIMIT-3] + '...'
+        return text
+    except Exception:
+        pass
+
+    try:
+        return file_bytes[:10240].decode('utf-8')
+    except Exception:
+        try:
+            return file_bytes[:10240].decode('latin-1')
+        except Exception:
+            return ''
+
+
+# ====================== CHAT LIST / CREATE ======================
 class ChatListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = ChatSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -37,11 +101,15 @@ class ChatListCreateAPIView(generics.ListCreateAPIView):
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)
 
+
+# ====================== CHAT RETRIEVE ======================
 class ChatRetrieveAPIView(generics.RetrieveAPIView):
     serializer_class = ChatSerializer
     permission_classes = [permissions.IsAuthenticated, IsOwner]
     queryset = Chat.objects.all()
-    
+
+
+# ====================== MESSAGE LIST =====================, UserOpenAISettingAPIView ======================
 class MessageListAPIView(generics.ListAPIView):
     serializer_class = MessageSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -50,15 +118,15 @@ class MessageListAPIView(generics.ListAPIView):
         chat_id = self.kwargs['chat_pk']
         chat = get_object_or_404(Chat, pk=chat_id, owner=self.request.user)
         return chat.messages.all().order_by('created_at')
-    
+
+
+# ====================== SEND MESSAGE (MAIN) ======================
 class SendMessageAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request, chat_pk):
-        # Make sure helper can see CHARACTER_LIMIT (works even if it’s already defined at module level)
-        global CHARACTER_LIMIT  # allows extract_text_from_excel_bytes to read it
-
+        global CHARACTER_LIMIT
         user = request.user
         chat = get_object_or_404(Chat, pk=chat_pk, owner=user)
 
@@ -68,7 +136,7 @@ class SendMessageAPIView(APIView):
         if not user_text and not attachment:
             return Response({'error': 'content or attachment is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # --- Extract attachment text (if any) ---
+        # --- Extract attachment text ---
         attachment_name = ''
         attachment_content_type = ''
         extracted_text = ''
@@ -77,9 +145,7 @@ class SendMessageAPIView(APIView):
                 attachment_name = getattr(attachment, 'name', '')
                 attachment_content_type = getattr(attachment, 'content_type', '')
 
-                # read bytes safely
                 file_bytes = attachment.read()
-                # reset pointer (in case Django needs it later)
                 try:
                     attachment.seek(0)
                 except Exception:
@@ -89,10 +155,8 @@ class SendMessageAPIView(APIView):
                 ct = (attachment_content_type or '').lower()
 
                 def _is_spreadsheet(lower_name: str, content_type: str) -> bool:
-                    # extensions
                     if lower_name.endswith(('.xlsx', '.xls', '.xlsm', '.xlsb', '.csv')):
                         return True
-                    # common and odd spreadsheet MIME types
                     spreadsheet_mimes = {
                         'application/vnd.ms-excel',
                         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -102,10 +166,8 @@ class SendMessageAPIView(APIView):
                     }
                     if content_type in spreadsheet_mimes:
                         return True
-                    # handle weird variants like "...spreadsheetml.sheet.main+xml"
                     if content_type.startswith('application/vnd.openxmlformats-officedocument.spreadsheetml'):
                         return True
-                    # generic
                     if 'spreadsheet' in content_type or content_type.endswith('/csv'):
                         return True
                     return False
@@ -121,7 +183,6 @@ class SendMessageAPIView(APIView):
                         'application/vnd.openxmlformats-officedocument.wordprocessingml'
                     )
 
-                # TXT
                 if lower.endswith('.txt') or (ct and ct.startswith('text/') and 'csv' not in ct):
                     try:
                         extracted_text = file_bytes.decode('utf-8')
@@ -131,7 +192,6 @@ class SendMessageAPIView(APIView):
                         except Exception:
                             extracted_text = ''
 
-                # PDF
                 elif lower.endswith('.pdf') or ct == 'application/pdf':
                     try:
                         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
@@ -146,7 +206,6 @@ class SendMessageAPIView(APIView):
                         logger.exception("PDF parse failed: %s", e)
                         extracted_text = ''
 
-                # --- IMPORTANT: spreadsheets BEFORE DOCX ---
                 elif _is_spreadsheet(lower, ct):
                     try:
                         extracted_text = extract_text_from_excel_bytes(file_bytes, attachment_name)
@@ -154,7 +213,6 @@ class SendMessageAPIView(APIView):
                         logger.exception("Excel parse failed: %s", e)
                         extracted_text = ''
 
-                # DOCX (tightened MIME check)
                 elif _is_word(lower, ct):
                     try:
                         d = docx.Document(io.BytesIO(file_bytes))
@@ -163,7 +221,6 @@ class SendMessageAPIView(APIView):
                         logger.exception("DOCX parse failed: %s", e)
                         extracted_text = ''
 
-                # Unknown binary → small preview
                 else:
                     try:
                         extracted_text = file_bytes[:10240].decode('utf-8')
@@ -176,11 +233,10 @@ class SendMessageAPIView(APIView):
             logger.exception("Attachment extraction failed")
             extracted_text = ''
 
-        # Limit extracted text size to avoid huge payloads (adjust as needed)
         if extracted_text and len(extracted_text) > CHARACTER_LIMIT:
             extracted_text = Truncator(extracted_text).chars(CHARACTER_LIMIT, truncate='...')
 
-        # --- Save user's message and attachment (so DB holds file) ---
+        # --- Save user message ---
         user_msg = Message.objects.create(
             chat=chat,
             role='user',
@@ -190,7 +246,7 @@ class SendMessageAPIView(APIView):
             attachment_content_type=attachment_content_type,
         )
 
-        # --- Prepare messages payload including extracted text ---
+        # --- Build messages_payload ---
         system_prompt = chat.system_prompt or ''
         messages_payload = []
         if system_prompt:
@@ -201,14 +257,12 @@ class SendMessageAPIView(APIView):
             base_content = m.content or ''
             if m.attachment:
                 att_note = f"[Attachment: {m.attachment_name} | content-type: {m.attachment_content_type}]"
-                # attach extracted_text only for the message we just saved
                 if m.pk == user_msg.pk and extracted_text:
                     att_note = att_note + "\n\n" + extracted_text
                 messages_payload.append({'role': m.role, 'content': (base_content + "\n\n" + att_note).strip()})
             else:
                 messages_payload.append({'role': m.role, 'content': base_content})
 
-        # If user sent an attachment and we couldn't inject it above (edge cases), add a synthetic message
         if attachment and extracted_text and not any(
             (msg.get('role') == 'user' and f"[Attachment content from {attachment_name}]" in msg.get('content', ''))
             for msg in messages_payload
@@ -218,45 +272,31 @@ class SendMessageAPIView(APIView):
                 'content': f"[Attachment content from {attachment_name}]\n\n{extracted_text}"
             })
 
-        # --- Logging for debugging: inspect what we will send to OpenAI ---
-        try:
-            logger.debug("OpenAI messages_payload keys: %s", [m.get('role') for m in messages_payload])
-        except Exception:
-            pass
+        logger.debug("OpenAI messages_payload keys: %s", [m.get('role') for m in messages_payload])
 
-        # Model + params (same as your existing logic)
+        # --- Model, temp, max_tokens ---
         user_setting = getattr(user, 'openai_setting', None)
-        model = request.data.get('model') or (user_setting.default_model if user_setting else 'gpt-4o')
-        try:
-            temperature = float(request.data.get('temperature') or (user_setting.temperature if user_setting else 0.2))
-        except Exception:
-            temperature = 0.2
-        try:
-            max_tokens = int(request.data.get('max_tokens') or (user_setting.max_tokens if user_setting else 1024))
-        except Exception:
-            max_tokens = 1024
+        model = (
+            request.data.get('model') or
+            (user_setting.default_model if user_setting else None) or
+            "gpt-5"  # <<<--- FORCED TO GPT-5
+        )
+        max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 8000))
+        temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
+
+        logger.debug("Sending to OpenAI → model=%s temp=%s max_output_tokens=%s", model, temperature, max_tokens)
 
         try:
-            client = openai.OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-            # resp = client.chat.completions.create(
-            #     model=model,
-            #     messages=messages_payload,
-            #     temperature=temperature,
-            #     max_tokens=max_tokens,
-            # )
-            # assistant_text = resp.choices[0].message.content
             from openai import OpenAI
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
 
-            # Convert your messages_payload (list of {role, content}) to Responses API "input"
-            input_items = [{"role": m["role"], "content": m["content"]} for m in messages_payload]
-
             resp = client.responses.create(
-                model=model or "gpt-4o-mini",
-                input=input_items,
-                tools=[{"type": "web_search"}],              # <-- enables browsing
+                model=model,
+                input=messages_payload,
+                instructions=system_prompt or None,
+                tools=[{"type": "web_search"}],
                 temperature=temperature,
-                max_output_tokens=max_tokens                 # name differs from max_tokens in Responses API
+                max_output_tokens=max_tokens,
             )
 
             assistant_text = resp.output_text
@@ -275,77 +315,9 @@ class SendMessageAPIView(APIView):
         except Exception as e:
             logger.exception("OpenAI call failed: %s", e)
             return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
-        
-def extract_text_from_excel_bytes(file_bytes, filename='file'):
-    import io, pandas as pd, openpyxl
-    parts = []
 
-    # Try pandas first (best for multiple sheets)
-    try:
-        ext = (filename or '').lower()
-        engine = None
-        if ext.endswith('.xls'):
-            # Needs xlrd==1.2.0
-            engine = 'xlrd'
-        elif ext.endswith('.xlsb'):
-            # Needs pyxlsb
-            engine = 'pyxlsb'
-        # .xlsx/.xlsm → openpyxl (engine=None lets pandas pick openpyxl if installed)
 
-        excel_data = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine=engine)
-        for sheet_name, df in excel_data.items():
-            df_small = df.iloc[:20, :20]  # keep it sane
-            header = "\t".join(map(str, df_small.columns))
-            rows = ["\t".join("" if pd.isna(v) else str(v) for v in row) for row in df_small.itertuples(index=False, name=None)]
-            parts.append(f"--- Sheet: {sheet_name} ---\n{header}\n" + ("\n".join(rows) if rows else "(no rows)"))
-        text = "\n\n".join(parts)
-        if len(text) > CHARACTER_LIMIT:
-            text = text[:CHARACTER_LIMIT-3] + '...'
-        if text.strip():
-            return text
-    except Exception:
-        pass
-
-    # Fallback: openpyxl for xlsx-like
-    try:
-        wb = openpyxl.load_workbook(filename=io.BytesIO(file_bytes), read_only=True, data_only=True)
-        for ws in wb.worksheets:
-            lines, max_rows, max_cols = [], 50, 50
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i >= max_rows: break
-                lines.append("\t".join("" if c is None else str(c) for c in (row[:max_cols])))
-            parts.append(f"--- Sheet: {ws.title} ---\n" + ("\n".join(lines) if lines else "(no rows)"))
-        text = "\n\n".join(parts)
-        if len(text) > CHARACTER_LIMIT:
-            text = text[:CHARACTER_LIMIT-3] + '...'
-        if text.strip():
-            return text
-    except Exception:
-        pass
-
-    # Fallback: maybe it's CSV
-    try:
-        import pandas as pd
-        df = pd.read_csv(io.BytesIO(file_bytes), nrows=200)
-        header = "\t".join(map(str, df.columns))
-        rows = ["\t".join("" if pd.isna(v) else str(v) for v in r) for r in df.head(50).itertuples(index=False, name=None)]
-        text = f"--- CSV ---\n{header}\n" + ("\n".join(rows) if rows else "(no rows)")
-        if len(text) > CHARACTER_LIMIT:
-            text = text[:CHARACTER_LIMIT-3] + '...'
-        return text
-    except Exception:
-        pass
-
-    # Last resort: tiny utf-8/latin-1 peek
-    try:
-        return file_bytes[:10240].decode('utf-8')
-    except Exception:
-        try:
-            return file_bytes[:10240].decode('latin-1')
-        except Exception:
-            return ''
-     
-
+# ====================== EDIT & RESEND ======================
 class EditAndResendAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -354,28 +326,23 @@ class EditAndResendAPIView(APIView):
         user = request.user
         chat = get_object_or_404(Chat, pk=chat_pk, owner=user)
 
-        # Accept content either from JSON body or query param for convenience
         new_content = (request.data.get('content') or request.GET.get('content') or '').strip()
         if not new_content:
             return Response({'error': 'content is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Try to find the message by id:
-        # Prefer a user message; if it's an assistant message, find the user message immediately before it.
         try:
             msg = Message.objects.get(pk=message_pk, chat=chat)
         except Message.DoesNotExist:
             return Response({'detail': 'No Message matches the given query.'}, status=status.HTTP_404_NOT_FOUND)
 
         if msg.role == 'assistant':
-            # find the closest prior user message
             user_msg = chat.messages.filter(role='user', created_at__lt=msg.created_at).order_by('-created_at').first()
             if not user_msg:
-                return Response({'detail': 'No preceding user message found for this assistant message.'}, status=status.HTTP_404_NOT_FOUND)
+                return Response({'detail': 'No preceding user message found.'}, status=status.HTTP_404_NOT_FOUND)
             msg = user_msg
         elif msg.role != 'user':
-            return Response({'detail': 'Message must be a user message or an assistant message that follows a user message.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Message must be a user message.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # At this point `msg` is the user message to edit
         original_content = msg.content or ''
         with transaction.atomic():
             meta = msg.metadata or {}
@@ -386,14 +353,11 @@ class EditAndResendAPIView(APIView):
             })
             msg.content = new_content
             msg.metadata = meta
-            try:
-                msg.edited = True
-                msg.edited_at = timezone.now()
-            except Exception:
-                pass
+            msg.edited = True
+            msg.edited_at = timezone.now()
             msg.save()
 
-            # Rebuild messages payload (same logic as your send view)
+            # Rebuild payload
             system_prompt = chat.system_prompt or ''
             messages_payload = []
             if system_prompt:
@@ -408,83 +372,71 @@ class EditAndResendAPIView(APIView):
                 else:
                     messages_payload.append({'role': m.role, 'content': content})
 
-            # Call OpenAI Responses API (same as before)
+            # Model & params
             user_setting = getattr(user, 'openai_setting', None)
-            model = request.data.get('model') or (user_setting.default_model if user_setting else 'gpt-4o')
-            try:
-                temperature = float(request.data.get('temperature') or (user_setting.temperature if user_setting else 0.2))
-            except Exception:
-                temperature = 0.2
-            try:
-                max_tokens = int(request.data.get('max_tokens') or (user_setting.max_tokens if user_setting else 1024))
-            except Exception:
-                max_tokens = 1024
-
-            from openai import OpenAI
-            client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-
-            input_items = [{"role": m["role"], "content": m["content"]} for m in messages_payload]
-            resp = client.responses.create(
-                model=model or "gpt-4o-mini",
-                input=input_items,
-                tools=[{"type": "web_search"}],
-                temperature=temperature,
-                max_output_tokens=max_tokens
+            model = (
+                request.data.get('model') or
+                (user_setting.default_model if user_setting else None) or
+                "gpt-5"
             )
+            max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 8000))
+            temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
 
-            assistant_text = getattr(resp, 'output_text', '') or ''
-            usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
+            logger.debug("Edit call → model=%s temp=%s max=%s", model, temperature, max_tokens)
 
-            # Update assistant message after the user message if exists, else create a new one
-            assistant_msg = chat.messages.filter(role='assistant', created_at__gt=msg.created_at).order_by('created_at').first()
-            if assistant_msg:
-                assistant_msg.content = assistant_text
-                meta = assistant_msg.metadata or {}
-                meta['openai_usage'] = usage
-                meta['replaced_by_edit_of'] = msg.pk
-                assistant_msg.metadata = meta
-                try:
-                    assistant_msg.updated_at = timezone.now()
-                except Exception:
-                    pass
-                assistant_msg.save()
-            else:
-                assistant_msg = Message.objects.create(
-                    chat=chat,
-                    role='assistant',
-                    content=assistant_text,
-                    metadata={'openai_usage': usage, 'replaced_by_edit_of': msg.pk}
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
+
+                resp = client.responses.create(
+                    model=model,
+                    input=messages_payload,
+                    instructions=system_prompt or None,
+                    tools=[{"type": "web_search"}],
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
                 )
 
-            serializer = MessageSerializer(assistant_msg, context={'request': request})
-            return Response(serializer.data, status=status.HTTP_200_OK)
+                assistant_text = getattr(resp, 'output_text', '') or ''
+                usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
+
+                assistant_msg = chat.messages.filter(role='assistant', created_at__gt=msg.created_at).order_by('created_at').first()
+                if assistant_msg:
+                    assistant_msg.content = assistant_text
+                    meta = assistant_msg.metadata or {}
+                    meta['openai_usage'] = usage
+                    meta['replaced_by_edit_of'] = msg.pk
+                    assistant_msg.metadata = meta
+                    assistant_msg.updated_at = timezone.now()
+                    assistant_msg.save()
+                else:
+                    assistant_msg = Message.objects.create(
+                        chat=chat,
+                        role='assistant',
+                        content=assistant_text,
+                        metadata={'openai_usage': usage, 'replaced_by_edit_of': msg.pk}
+                    )
+
+                serializer = MessageSerializer(assistant_msg, context={'request': request})
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+            except Exception as e:
+                logger.exception("OpenAI edit call failed: %s", e)
+                return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+# ====================== DELETE CHAT ======================
 class DeleteChatAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def delete(self, request, chat_pk):
-        """Delete a specific chat and all its related messages"""
         user = request.user
         chat = get_object_or_404(Chat, pk=chat_pk, owner=user)
-
-        # Delete chat (cascade deletes messages if related_name is set properly)
-        chat_title = chat.title if hasattr(chat, 'title') else f"Chat {chat.pk}"
         chat.delete()
-
         return Response(status=status.HTTP_204_NO_CONTENT)
-        
-# class BulkDeleteChatsAPIView(APIView):
-#     permission_classes = [permissions.IsAuthenticated]
 
-#     def delete(self, request):
-#         """Delete multiple chats by IDs"""
-#         chat_ids = request.data.get('chat_ids', [])
-#         if not chat_ids or not isinstance(chat_ids, list):
-#             return Response({'error': 'chat_ids (list) is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-#         deleted_count, _ = Chat.objects.filter(owner=request.user, pk__in=chat_ids).delete()
-#         return Response({'deleted': deleted_count}, status=status.HTTP_204_NO_CONTENT)        
-        
-# Simple endpoint to update/get user OpenAI settings
+# ====================== USER OPENAI SETTINGS ======================
 class UserOpenAISettingAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
