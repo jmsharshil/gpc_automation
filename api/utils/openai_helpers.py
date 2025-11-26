@@ -84,49 +84,108 @@ def call_openai_compare(company_desc, user_desc, model=None, timeout=None):
     model = model or getattr(settings, "OPENAI_MODEL", "gpt-3.5-turbo")
     timeout = timeout or getattr(settings, "OPENAI_TIMEOUT", 15)
 
+## Harshil made new prompt with word steamming addition - objective "High" matches more likely
     prompt = f"""
-You are an assistant that compares business descriptions.
+    
+    You are an assistant that compares business descriptions.
 
 Input:
 - company_description: \"\"\"{company_desc or ''}\"\"\"
 - subject_description: \"\"\"{user_desc or ''}\"\"\"
-
-Task:
+    
+    Task:
 You are performing comparable company screening for a private company valuation using the Guideline Public Company (GPC) Method.
 
 Steps:
 1. Read and understand the subject company’s business model, technology, and end markets.
 2. Read the public company’s business description.
-3. Apply the screening logic as follows:
+3. Screening Logic:
    - Each entry in screening_keywords is treated as a separate screening phrase.
    - For each phrase:
        - Split the phrase into individual words.
-       - The phrase matches only if **all words** in that phrase appear anywhere in the business description, in any order or sentence.
-       - Matching is **case-insensitive**.
-       - **Word stemming is applied**: words are matched to their root forms (for example, “acquire” matches “acquiring”, “acquired”, “acquisition”).
-       - If any word in a phrase is missing, that phrase does not match.
-   - Apply **OR logic** across all phrases:
-       - If at least one phrase fully matches, set `passes_screen` to "Yes".
-       - If none match, set `passes_screen` to "No".
-4. Based on qualitative similarity between the subject company and the public company, assign a similarity category:
-   - "High" → Strong overlap in industry, technology, and target markets.
-   - "Medium" → Partial overlap in technology or market focus.
-   - "Low" → Minimal or no overlap in business model, industry, or technology.
- 
+       - A word is considered present if **any morphological form of that word** (via stemming) appears anywhere in the business description.  
+         Examples: "manage" should match "manages", "manager", "managed", "management".
+       - Stemming must be applied bidirectionally:
+           - The root form of the keyword matches variations in the descriptions.
+           - Variations in the descriptions are reduced to root form to check against the keyword.
+       - The phrase matches only if **all** stemmed words appear (case-insensitive, any order).
+   - OR logic across all screening phrases:
+       - If at least one phrase fully matches, `passes_screen = "Yes"`.
+       - If none match, `passes_screen = "No"`.
+
+4. Similarity assessment:
+   - Consider industry, technology, market focus, and business activities.
+   - Apply **word-stemming** when comparing subject and company descriptions, so that conceptual matches are not missed due to different word forms.
+   - Assign similarity:
+       - "High" → Strong overlap in industry, technology, or markets.
+       - "Medium" → Partial overlap.
+       - "Low" → Minimal or no overlap.
+
 Return a JSON object exactly with these keys:
-- similarity: must be one of "High", "Medium", or "Low" (exactly those strings, capitalized).
-- passes_screen: must be "Yes" if at least one screening phrase matched, otherwise "No".
-- rationale: a concise (1–3 sentence) explanation describing the similarity level and screening outcome.
- 
+- similarity: "High", "Medium", or "Low"
+- passes_screen: "Yes" or "No"
+- rationale: concise 1–3 sentences explaining similarity level and screening outcome.
+
 Constraints:
-- Output only valid JSON (no extra commentary or formatting).
-- Matching is case-insensitive, allows words to appear in any order or sentence, and applies stemming.
-- All words in a multi-word phrase must be present for a match.
-- Keep rationale concise (1–3 sentences).
-- If company_description is empty, set similarity to "Low", passes_screen to "No", and rationale to "Insufficient company information to assess comparability."
-"""
+- Output only valid JSON.
+- Matching is case-insensitive and applies full word-stemming.
+- Words in phrases must all be present (after stemming) for a match.
+- If company_description is empty:
+   similarity = "Low"
+   passes_screen = "No"
+   rationale = "Insufficient company information to assess comparability."
+    
+     """
 
 
+## Harpreet Changed Old Prompt with this Prompt - Stable Prompt
+#     prompt = f"""
+# You are an assistant that compares business descriptions.
+
+# Input:
+# - company_description: \"\"\"{company_desc or ''}\"\"\"
+# - subject_description: \"\"\"{user_desc or ''}\"\"\"
+
+# Task:
+# You are performing comparable company screening for a private company valuation using the Guideline Public Company (GPC) Method.
+
+# Steps:
+# 1. Read and understand the subject company’s business model, technology, and end markets.
+# 2. Read the public company’s business description.
+# 3. Apply the screening logic as follows:
+#    - Each entry in screening_keywords is treated as a separate screening phrase.
+#    - For each phrase:
+#        - Split the phrase into individual words.
+#        - The phrase matches only if **all words** in that phrase appear anywhere in the business description, in any order or sentence.
+#        - Matching is **case-insensitive**.
+#        - **Word stemming is applied**: words are matched to their root forms (for example, “acquire” matches “acquiring”, “acquired”, “acquisition”).
+#        - If any word in a phrase is missing, that phrase does not match.
+#    - Apply **OR logic** across all phrases:
+#        - If at least one phrase fully matches, set `passes_screen` to "Yes".
+#        - If none match, set `passes_screen` to "No".
+# 4. Based on qualitative similarity between the subject company and the public company, assign a similarity category:
+#    - "High" → Strong overlap in industry, technology, and target markets.
+#    - "Medium" → Partial overlap in technology or market focus.
+#    - "Low" → Minimal or no overlap in business model, industry, or technology.
+ 
+# Return a JSON object exactly with these keys:
+# - similarity: must be one of "High", "Medium", or "Low" (exactly those strings, capitalized).
+# - passes_screen: must be "Yes" if at least one screening phrase matched, otherwise "No".
+# - rationale: a concise (1–3 sentence) explanation describing the similarity level and screening outcome.
+ 
+# Constraints:
+# - Output only valid JSON (no extra commentary or formatting).
+# - Matching is case-insensitive, allows words to appear in any order or sentence, and applies stemming.
+# - All words in a multi-word phrase must be present for a match.
+# - Keep rationale concise (1–3 sentences).
+# - If company_description is empty, set similarity to "Low", passes_screen to "No", and rationale to "Insufficient company information to assess comparability."
+# """
+
+
+#-----------------------------------------------------------------------
+
+
+## Initial prompt version without screening logic details
 #     prompt = f"""
 # You are an assistant that compares business descriptions.
 
