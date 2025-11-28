@@ -300,7 +300,10 @@ class SendMessageAPIView(APIView):
             )
 
             assistant_text = resp.output_text
+            actual_model = resp.model
             usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
+            
+            logger.warning("ACTUAL MODEL USED: %s", actual_model)
 
             assistant_msg = Message.objects.create(
                 chat=chat,
