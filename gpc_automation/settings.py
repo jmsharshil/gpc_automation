@@ -301,4 +301,4 @@ MICROSOFT_OAUTH_TOKEN_URL = (
 MICROSOFT_GRAPH_USER_URL = "https://graph.microsoft.com/v1.0/me"
 
 # 🔥 THIS MUST POINT TO REDIRECT CALLBACK (NOT callback-json)
-MICROSOFT_OAUTH_REDIRECT_URI = "http://localhost:8000/auth/microsoft/callback/"
+MICROSOFT_OAUTH_REDIRECT_URI = "http://localhost:5173/microsoft"
