@@ -1,4 +1,4 @@
-name: Build and deploy Python app to Azure Web App - gpcautomation
+name: Build and deploy Python app to Azure Web App - gpcauto
 
 on:
   push:
@@ -32,14 +32,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Zip deploy folder
-        run: |
-          zip -r deployment.zip . \
-            -x "*.git*" "*__pycache__*" "antenv/*" "venv/*"
+        run: zip -r deployment.zip . -x "*.git*" "*__pycache__*" "venv/*" "antenv/*"
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'gpcautomation'
+          app-name: 'gpcauto'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_025B7535F060407792D9097D10CB04E7 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_8955AD0AAD8345C2A0C0C453A5541B6B }}
           package: deployment.zip
