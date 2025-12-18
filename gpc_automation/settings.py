@@ -58,6 +58,9 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ]
 }
 
 MIDDLEWARE = [
@@ -284,3 +287,18 @@ if USE_AZURE_MEDIA:
 else:
     MEDIA_URL  = "/media/"
     MEDIA_ROOT = os.path.join(BASE_DIR, "media")
+
+
+
+MICROSOFT_OAUTH_AUTHORIZE_URL = (
+    f"https://login.microsoftonline.com/{MICROSOFT_OAUTH_TENANT_ID}/oauth2/v2.0/authorize"
+)
+
+MICROSOFT_OAUTH_TOKEN_URL = (
+    f"https://login.microsoftonline.com/{MICROSOFT_OAUTH_TENANT_ID}/oauth2/v2.0/token"
+)
+
+MICROSOFT_GRAPH_USER_URL = "https://graph.microsoft.com/v1.0/me"
+
+# 🔥 THIS MUST POINT TO REDIRECT CALLBACK (NOT callback-json)
+MICROSOFT_OAUTH_REDIRECT_URI = "http://localhost:8000/auth/microsoft/callback/"

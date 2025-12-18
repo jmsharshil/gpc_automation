@@ -68,103 +68,65 @@ def microsoft_login(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def microsoft_callback(request):
-    """
-    Handle Microsoft OAuth callback with PKCE
-    """
-    code = request.GET.get('code')
-    state = request.GET.get('state')
-    error = request.GET.get('error')
-    
-    # Debug logging
-    print(f"Callback received - Code: {bool(code)}, State: {state}, Error: {error}")
-    print(f"All GET parameters: {dict(request.GET)}")
-    print(f"Current state storage: {list(_state_storage.keys())}")
-    
+    code = request.GET.get("code")
+    state = request.GET.get("state")
+    error = request.GET.get("error")
+
     if error:
-        return Response({
-            'error': 'Authentication failed',
-            'details': request.GET.get('error_description', 'Unknown error')
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
+        return Response({"error": error}, status=400)
+
     if not code:
-        return Response({
-            'error': 'Authorization code not provided'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Verify state token
-    if state and state not in _state_storage:
-        return Response({
-            'error': 'Invalid state parameter',
-            'debug': {
-                'received_state': state,
-                'stored_states': list(_state_storage.keys()),
-                'state_exists': state in _state_storage if state else False
-            }
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Get code verifier for PKCE
-    code_verifier = _pkce_storage.get(state) if state else None
-    
-    # Remove used state token and code verifier if they exist
-    if state and state in _state_storage:
-        del _state_storage[state]
-    if state and state in _pkce_storage:
-        del _pkce_storage[state]
-    
-    # Exchange authorization code for access token with PKCE
+        return Response({"error": "Authorization code missing"}, status=400)
+
+    if state not in _state_storage:
+        return Response({"error": "Invalid state"}, status=400)
+
+    code_verifier = _pkce_storage.get(state)
+
+    # cleanup
+    del _state_storage[state]
+    del _pkce_storage[state]
+
     token_data = {
-        'client_id': settings.MICROSOFT_OAUTH_CLIENT_ID,
-        'client_secret': settings.MICROSOFT_OAUTH_CLIENT_SECRET,
-        'code': code,
-        'grant_type': 'authorization_code',
-        'redirect_uri': settings.MICROSOFT_OAUTH_REDIRECT_URI,
+        "client_id": settings.MICROSOFT_OAUTH_CLIENT_ID,
+        "client_secret": settings.MICROSOFT_OAUTH_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": settings.MICROSOFT_OAUTH_REDIRECT_URI,
+        "code_verifier": code_verifier,
     }
-    
-    # Add PKCE code verifier if available
-    if code_verifier:
-        token_data['code_verifier'] = code_verifier
-    
-    try:
-        token_response = requests.post(settings.MICROSOFT_OAUTH_TOKEN_URL, data=token_data)
-        token_response.raise_for_status()
-        token_json = token_response.json()
-        
-        access_token = token_json.get('access_token')
-        
-        if not access_token:
-            return Response({
-                'error': 'Failed to obtain access token'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Get user information from Microsoft Graph
-        headers = {'Authorization': f'Bearer {access_token}'}
-        user_response = requests.get(settings.MICROSOFT_GRAPH_USER_URL, headers=headers)
-        user_response.raise_for_status()
-        user_data = user_response.json()
-        
-        # Create or get user
-        user = create_or_get_user(user_data)
-        
-        # Generate JWT tokens
-        refresh = RefreshToken.for_user(user)
-        access = refresh.access_token
-        
-        # Determine role-based redirect URL (customize as needed)
-        if user.is_admin:
-            redirect_url = "http://localhost:3000/admin-dashboard"
-        else:
-            redirect_url = "http://localhost:3000/user-dashboard"
-        
-        # Add tokens as query parameters (alternatively, use cookies)
-        redirect_url += f"?access_token={str(access)}&refresh_token={str(refresh)}&user_role={user.role}"
-        
-        return HttpResponseRedirect(redirect_url)
-        
-    except requests.RequestException as e:
-        return Response({
-            'error': 'Failed to authenticate with Microsoft',
-            'details': str(e)
-        }, status=status.HTTP_400_BAD_REQUEST)
+
+    token_response = requests.post(
+        settings.MICROSOFT_OAUTH_TOKEN_URL, data=token_data
+    )
+    token_response.raise_for_status()
+    token_json = token_response.json()
+
+    access_token = token_json.get("access_token")
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    user_response = requests.get(
+        settings.MICROSOFT_GRAPH_USER_URL, headers=headers
+    )
+    user_response.raise_for_status()
+    user_data = user_response.json()
+
+    user = create_or_get_user(user_data)
+
+    refresh = RefreshToken.for_user(user)
+    access_jwt = refresh.access_token
+
+    # 🔥 FRONTEND REDIRECT (THIS IS THE KEY)
+    frontend_url = "http://localhost:5173/auth/microsoft/success"
+    redirect_url = (
+        f"{frontend_url}"
+        f"?access_token={access_jwt}"
+        f"&refresh_token={refresh}"
+        f"&role={user.role}"
+    )
+
+    return HttpResponseRedirect(redirect_url)
+
 
 def create_or_get_user(user_data):
     """
