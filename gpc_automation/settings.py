@@ -28,7 +28,7 @@ SECRET_KEY = 'django-insecure-d!-t&!5j1u7r+6gt938@r-y8mdz=fttnhs$!r^hrjwdvf9aht6
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ['gpcautomation-hbedaghhb8ffctep.centralindia-01.azurewebsites.net','gpcauto.s3-website.ap-south-1.amazonaws.com','gpcautomation.s3-website.ap-south-1.amazonaws.com','localhost','127.0.0.1','gpc-h0eth6gagwh3f3ad.centralindia-01.azurewebsites.net']
+ALLOWED_HOSTS = ['gpcauto-ezh4e7hcf8dzbpcy.centralindia-01.azurewebsites.net','gpcauto.s3-website.ap-south-1.amazonaws.com','gpcautomation.s3-website.ap-south-1.amazonaws.com','localhost','127.0.0.1','gpc-h0eth6gagwh3f3ad.centralindia-01.azurewebsites.net']
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # choose a model you have access to
