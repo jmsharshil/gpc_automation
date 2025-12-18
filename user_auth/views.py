@@ -117,7 +117,7 @@ def microsoft_callback(request):
     access_jwt = refresh.access_token
 
     # 🔥 FRONTEND REDIRECT (THIS IS THE KEY)
-    frontend_url = "http://localhost:5173/microsoft"
+    frontend_url = "http://localhost:5173/auth/microsoft/success"
     redirect_url = (
         f"{frontend_url}"
         f"?access_token={access_jwt}"
