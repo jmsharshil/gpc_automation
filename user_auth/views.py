@@ -117,7 +117,7 @@ def microsoft_callback(request):
     access_jwt = refresh.access_token
 
     # 🔥 FRONTEND REDIRECT (THIS IS THE KEY)
-    frontend_url = "https://gpcblobstorage.z30.web.core.windows.ne/auth/microsoft/success"
+    frontend_url = "https://gpcblobstorage.z30.web.core.windows.net/auth/microsoft/success"
     redirect_url = (
         f"{frontend_url}"
         f"?access_token={access_jwt}"
