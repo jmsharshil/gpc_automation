@@ -705,8 +705,9 @@ class CompanyListAPIView(generics.ListAPIView):
 
         # Company-level filters
         raw_countries = self.request.GET.getlist('headquarters_country_region') or self.request.GET.getlist('country')
-        primary_sector = self.request.GET.get('primary_sector')
-        primary_industry = self.request.GET.get('primary_industry')
+        raw_sectors = self.request.GET.getlist('primary_sector')
+        raw_industries = self.request.GET.getlist('primary_industry')
+
 
         if not raw_countries:
             single = self.request.GET.get('headquarters_country_region') or self.request.GET.get('country')
@@ -721,10 +722,27 @@ class CompanyListAPIView(generics.ListAPIView):
                 # case-insensitive exact match
                 q_country |= Q(headquarters_country_region__iexact=c)
             qs_companies = qs_companies.filter(q_country)
-        if primary_sector:
-            qs_companies = qs_companies.filter(primary_sector__icontains=primary_sector)
-        if primary_industry:
-            qs_companies = qs_companies.filter(primary_industry__icontains=primary_industry)
+        if not raw_sectors:
+            single = self.request.GET.get('primary_sector')
+            if single:
+                raw_sectors = [s.strip() for s in re.split(r'[;,|]+', single) if s.strip()]
+
+        if not raw_industries:
+            single = self.request.GET.get('primary_industry')
+            if single:
+                raw_industries = [i.strip() for i in re.split(r'[;,|]+', single) if i.strip()]
+
+        if raw_sectors:
+            q_sector = Q()
+            for s in raw_sectors:
+                q_sector |= Q(primary_sector__icontains=s)
+            qs_companies = qs_companies.filter(q_sector)
+
+        if raw_industries:
+            q_industry = Q()
+            for i in raw_industries:
+                q_industry |= Q(primary_industry__icontains=i)
+            qs_companies = qs_companies.filter(q_industry)
 
         fpd_min = _get_date(self.request.GET.get('first_pricing_date_min'))
         fpd_max = _get_date(self.request.GET.get('first_pricing_date_max'))
