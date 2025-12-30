@@ -78,102 +78,131 @@ def call_openai_compare(company_desc, user_desc, model=None, timeout=None):
     timeout = timeout or getattr(settings, "OPENAI_TIMEOUT", 15)
 
     prompt = f"""
-You are a financial valuation expert comparing companies using the Guideline Public Company (GPC) Method. Your goal is to identify comparable companies for accurate valuation.
+        Subject Company:
 
-Input:
-- subject_description: \"\"\"{user_desc or ''}\"\"\"
-- company_description: \"\"\"{company_desc or ''}\"\"\"
+        \"\"\"{user_desc or ''}\"\"\"
 
-Task:
-Perform a comprehensive comparability analysis to find companies that could serve as valuation comparables.
+        Comparable Company:
 
-**1. KEYWORD SCREENING (if subject_description contains keywords):**
-   - If subject_description is keywords/phrases (< 50 words):
-     * Apply word stemming: "manage" matches "management", "managed", "managing"
-     * Each phrase must have ALL words present (after stemming)
-     * OR logic: ANY matching phrase → passes_screen = "Yes"
+        \"\"\"{company_desc or ''}\"\"\"
 
-**2. COMPARABILITY ANALYSIS:**
+        Task:
 
-Evaluate these key dimensions:
+        Using professional judgment, assess how similar the two companies’ business models are.
 
-A. **Industry & Market Focus**
-   - Same or adjacent industries
-   - Overlapping market segments
-   - Similar end customers or use cases
-   - Examples: "Financial technology" ≈ "Fintech solutions" ≈ "Banking software" = Strong match
+        Consider:
+        - Value proposition
+        - Revenue model
+        - Target customers
+        - Product/service type
+        - Role in the value chain
 
-B. **Business Model & Operations**
-   - Revenue model (SaaS, licensing, hardware sales, services, etc.)
-   - Business type (B2B, B2C, marketplace, platform)
-   - Delivery method (cloud, on-premise, hybrid)
-   - Examples: "Cloud-based subscription" ≈ "SaaS platform" = Strong match
+        Return ONLY valid JSON:
+        {{
+        "similarity": "High" | "Medium" | "Low",
+        "rationale": "2–3 sentence analyst-style explanation",
+        "confidence": "High" | "Medium" | "Low"
+        }}
+        """
 
-C. **Product/Service Category**
-   - What problem do they solve?
-   - Core offerings and solutions
-   - Technology or methodology used
-   - Examples: "HR software" ≈ "Human capital management" ≈ "Workforce solutions" = Strong match
+# New Promot - responding "High" more often - Harshil
+#     prompt = f"""
+# You are a financial valuation expert comparing companies using the Guideline Public Company (GPC) Method. Your goal is to identify comparable companies for accurate valuation.
 
-D. **Customer & Market Segment**
-   - Target company size (enterprise, mid-market, SMB)
-   - Geographic markets
-   - Industry verticals served
-   - Examples: "Enterprise customers" ≈ "Large organizations" = Strong match
+# Input:
+# - subject_description: \"\"\"{user_desc or ''}\"\"\"
+# - company_description: \"\"\"{company_desc or ''}\"\"\"
 
-**SIMILARITY SCORING - BE GENEROUS WITH HIGH:**
+# Task:
+# Perform a comprehensive comparability analysis to find companies that could serve as valuation comparables.
 
-**"High" - Assign when:**
-- Companies operate in the SAME or CLOSELY RELATED industries
-- Share SIMILAR business models or revenue approaches
-- Target SIMILAR customer segments or markets
-- Offer COMPARABLE products/services (even with different terminology)
-- Would be considered REASONABLE comparables by valuation professionals
-- At least 2 dimensions show STRONG alignment
-- **Think broadly**: If an investor would group them together, it's likely "High"
+# **1. KEYWORD SCREENING (if subject_description contains keywords):**
+#    - If subject_description is keywords/phrases (< 50 words):
+#      * Apply word stemming: "manage" matches "management", "managed", "managing"
+#      * Each phrase must have ALL words present (after stemming)
+#      * OR logic: ANY matching phrase → passes_screen = "Yes"
 
-Examples of HIGH similarity:
-- "Healthcare SaaS" vs "Medical software solutions"
-- "E-commerce platform" vs "Online retail technology"
-- "Cybersecurity services" vs "Information security solutions"
-- "AI-powered analytics" vs "Machine learning data insights"
-- "Payment processing" vs "Transaction management systems"
+# **2. COMPARABILITY ANALYSIS:**
 
-**"Medium" - Assign when:**
-- Companies are in RELATED but not identical industries
-- Different business models but serve similar markets
-- Adjacent product categories or customer segments
-- 1 dimension shows strong alignment OR 2 dimensions show moderate alignment
-- Could be considered as comparables with some adjustments
+# Evaluate these key dimensions:
 
-**"Low" - Assign when:**
-- Completely DIFFERENT industries with no overlap
-- Fundamentally different business models AND markets
-- No meaningful connection in products, customers, or operations
-- Would NOT be used as comparables in valuation
+# A. **Industry & Market Focus**
+#    - Same or adjacent industries
+#    - Overlapping market segments
+#    - Similar end customers or use cases
+#    - Examples: "Financial technology" ≈ "Fintech solutions" ≈ "Banking software" = Strong match
 
-**IMPORTANT GUIDELINES:**
-1. **Be inclusive, not exclusive**: When in doubt between High and Medium, choose High
-2. **Focus on economic substance**: Look at what they DO, not just keywords
-3. **Apply synonym matching liberally**: Different words often mean the same thing
-4. **Consider industry context**: Understand sector-specific terminology
-5. **Think like an investor**: Would these companies trade at similar multiples?
-6. **Conceptual similarity matters**: "software for hospitals" = "healthcare IT solutions" = HIGH
-7. **Don't penalize for description brevity**: Limited info shouldn't automatically mean Low
+# B. **Business Model & Operations**
+#    - Revenue model (SaaS, licensing, hardware sales, services, etc.)
+#    - Business type (B2B, B2C, marketplace, platform)
+#    - Delivery method (cloud, on-premise, hybrid)
+#    - Examples: "Cloud-based subscription" ≈ "SaaS platform" = Strong match
 
-**SPECIAL RULES:**
-- If company_description is empty/vague → "Low" similarity
-- Use word stemming and synonym recognition throughout
-- Output confidence level based on description quality
+# C. **Product/Service Category**
+#    - What problem do they solve?
+#    - Core offerings and solutions
+#    - Technology or methodology used
+#    - Examples: "HR software" ≈ "Human capital management" ≈ "Workforce solutions" = Strong match
 
-Return ONLY valid JSON:
-{{
-  "similarity": "High" | "Medium" | "Low",
-  "passes_screen": "Yes" | "No",
-  "rationale": "Explain the match with specific details (2-3 sentences)",
-  "confidence": "High" | "Medium" | "Low"
-}}
-"""
+# D. **Customer & Market Segment**
+#    - Target company size (enterprise, mid-market, SMB)
+#    - Geographic markets
+#    - Industry verticals served
+#    - Examples: "Enterprise customers" ≈ "Large organizations" = Strong match
+
+# **SIMILARITY SCORING - BE GENEROUS WITH HIGH:**
+
+# **"High" - Assign when:**
+# - Companies operate in the SAME or CLOSELY RELATED industries
+# - Share SIMILAR business models or revenue approaches
+# - Target SIMILAR customer segments or markets
+# - Offer COMPARABLE products/services (even with different terminology)
+# - Would be considered REASONABLE comparables by valuation professionals
+# - At least 2 dimensions show STRONG alignment
+# - **Think broadly**: If an investor would group them together, it's likely "High"
+
+# Examples of HIGH similarity:
+# - "Healthcare SaaS" vs "Medical software solutions"
+# - "E-commerce platform" vs "Online retail technology"
+# - "Cybersecurity services" vs "Information security solutions"
+# - "AI-powered analytics" vs "Machine learning data insights"
+# - "Payment processing" vs "Transaction management systems"
+
+# **"Medium" - Assign when:**
+# - Companies are in RELATED but not identical industries
+# - Different business models but serve similar markets
+# - Adjacent product categories or customer segments
+# - 1 dimension shows strong alignment OR 2 dimensions show moderate alignment
+# - Could be considered as comparables with some adjustments
+
+# **"Low" - Assign when:**
+# - Completely DIFFERENT industries with no overlap
+# - Fundamentally different business models AND markets
+# - No meaningful connection in products, customers, or operations
+# - Would NOT be used as comparables in valuation
+
+# **IMPORTANT GUIDELINES:**
+# 1. **Be inclusive, not exclusive**: When in doubt between High and Medium, choose High
+# 2. **Focus on economic substance**: Look at what they DO, not just keywords
+# 3. **Apply synonym matching liberally**: Different words often mean the same thing
+# 4. **Consider industry context**: Understand sector-specific terminology
+# 5. **Think like an investor**: Would these companies trade at similar multiples?
+# 6. **Conceptual similarity matters**: "software for hospitals" = "healthcare IT solutions" = HIGH
+# 7. **Don't penalize for description brevity**: Limited info shouldn't automatically mean Low
+
+# **SPECIAL RULES:**
+# - If company_description is empty/vague → "Low" similarity
+# - Use word stemming and synonym recognition throughout
+# - Output confidence level based on description quality
+
+# Return ONLY valid JSON:
+# {{
+#   "similarity": "High" | "Medium" | "Low",
+#   "passes_screen": "Yes" | "No",
+#   "rationale": "Explain the match with specific details (2-3 sentences)",
+#   "confidence": "High" | "Medium" | "Low"
+# }}
+# """
 
     try:
         resp = client.chat.completions.create(

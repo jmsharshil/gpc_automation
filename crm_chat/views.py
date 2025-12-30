@@ -19,6 +19,7 @@ import pandas as pd
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
+from django.http import HttpResponse
 
 logger = logging.getLogger(__name__)
 
@@ -453,3 +454,43 @@ class UserOpenAISettingAPIView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+class ExportLatestAssistantMessageAPIView(APIView):
+    # permission_classes = [IsAuthenticated, IsOwner]
+
+    def post(self, request, chat_pk):
+        chat = get_object_or_404(Chat, pk=chat_pk, owner=request.user)
+
+        assistant_msg = (
+            chat.messages
+            .filter(role='assistant')
+            .order_by('-created_at')
+            .first()
+        )
+
+        if not assistant_msg or not assistant_msg.content:
+            return Response(
+                {"error": "No assistant response found"},
+                status=400
+            )
+
+        # Create DOCX in memory
+        doc = docx.Document()
+        doc.add_heading("GPT Response", level=1)
+        doc.add_paragraph(assistant_msg.content)
+
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type=(
+                'application/vnd.openxmlformats-officedocument.'
+                'wordprocessingml.document'
+            )
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="chat_{chat.pk}_latest_response.docx"'
+        )
+
+        return response    
