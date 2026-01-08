@@ -36,9 +36,9 @@ class Message(models.Model):
 
 class UserOpenAISetting(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='openai_setting')
-    default_model = models.CharField(max_length=100, default='gpt-5')
-    temperature = models.FloatField(default=1)
-    max_tokens = models.IntegerField(default=50000)
+    default_model = models.CharField(max_length=100, default='gpt-4.1')
+    temperature = models.FloatField(default=0.3)
+    max_tokens = models.IntegerField(default=1200)
 
 
     def __str__(self):
