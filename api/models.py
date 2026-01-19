@@ -30,7 +30,7 @@ class FinancialRecord(models.Model):
     enterprise_value = models.DecimalField(max_digits=30, decimal_places=6, blank=True, null=True)
     ebitda = models.DecimalField(max_digits=30, decimal_places=6, blank=True, null=True)
     ev_revenu = models.DecimalField(max_digits=30, decimal_places=6, blank=True, null=True)
-
+    ev_ebitda = models.DecimalField(max_digits=30, decimal_places=6, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

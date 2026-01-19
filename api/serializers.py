@@ -23,7 +23,7 @@ class FinancialRecordSerializer(serializers.ModelSerializer):
         model = FinancialRecord
         fields = [
             'id', 'company', 'company_id', 'company_name', 'period',
-            'market_cap', 'total_revenue', 'enterprise_value', 'ebitda', 'ev_revenu',
+            'market_cap', 'total_revenue', 'enterprise_value', 'ebitda', 'ev_revenu', 'ev_ebitda',
             'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'company_name', 'company_id']

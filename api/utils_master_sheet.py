@@ -201,6 +201,7 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                 enterprise_value = _parse_decimal(row.get("Total Enterprise Value [My Setting] [Latest] ($USDmm, Historical rate)"))
                 ebitda = _parse_decimal(row.get("EBITDA [LTM] ($USDmm, Historical rate)"))
                 ev_revenu = _parse_decimal(row.get("EV/ Revenu"))
+                ev_ebitda = _parse_decimal(row.get("EV/ EBITDA"))
                 
                 # NEW: read/parse first pricing date
                 first_pricing_date_raw = row.get("First Pricing Date")
@@ -301,7 +302,8 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                     'total_revenue': total_revenue,
                     'enterprise_value': enterprise_value,
                     'ebitda': ebitda,
-                    'ev_revenu': ev_revenu
+                    'ev_revenu': ev_revenu,
+                    'ev_ebitda': ev_ebitda,
                 }
 
                 fr = FinancialRecord.objects.filter(company=company, period=period).first()

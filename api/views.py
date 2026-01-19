@@ -760,6 +760,14 @@ class CompanyListAPIView(generics.ListAPIView):
             fr_q &= Q(ev_revenu__gte=ev_rev_min)
         if ev_rev_max is not None:
             fr_q &= Q(ev_revenu__lte=ev_rev_max)
+            
+        ev_ebitda_min = _get_decimal(self.request.GET.get('ev_ebitda_min'))
+        ev_ebitda_max = _get_decimal(self.request.GET.get('ev_ebitda_max'))
+        if ev_ebitda_min is not None:
+            fr_q &= Q(ev_ebitda__gte=ev_ebitda_min)
+        if ev_ebitda_max is not None:
+            fr_q &= Q(ev_ebitda__lte=ev_ebitda_max)
+
 
         total_rev_min = _get_decimal(self.request.GET.get('total_revenue_min'))
         total_rev_max = _get_decimal(self.request.GET.get('total_revenue_max'))
@@ -777,6 +785,7 @@ class CompanyListAPIView(generics.ListAPIView):
 
         any_fin_filter = any([
             ev_rev_min, ev_rev_max,
+            ev_ebitda_min, ev_ebitda_max,
             total_rev_min, total_rev_max,
             entval_min, entval_max
         ])
