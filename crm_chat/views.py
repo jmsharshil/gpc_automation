@@ -20,10 +20,12 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
 from django.http import HttpResponse
+from django.core.files.base import ContentFile
+from django.http import StreamingHttpResponse
 
 logger = logging.getLogger(__name__)
 
-CHARACTER_LIMIT = 100_000  # You increased this
+CHARACTER_LIMIT = 8000  # You increased this
 
 openai.api_key = getattr(settings, 'OPENAI_API_KEY', None)
 
@@ -120,6 +122,20 @@ class MessageListAPIView(generics.ListAPIView):
         chat = get_object_or_404(Chat, pk=chat_id, owner=self.request.user)
         return chat.messages.all().order_by('created_at')
 
+def trim_messages_by_chars(messages, max_chars=12000):
+    total = 0
+    trimmed = []
+
+    # Start from latest messages
+    for msg in reversed(messages):
+        content = msg.get("content", "")
+        total += len(content)
+        if total > max_chars:
+            break
+        trimmed.insert(0, msg)
+
+    return trimmed
+
 
 # ====================== SEND MESSAGE (MAIN) ======================
 class SendMessageAPIView(APIView):
@@ -137,6 +153,15 @@ class SendMessageAPIView(APIView):
         if not user_text and not attachment:
             return Response({'error': 'content or attachment is required'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ✅ ADD THIS BLOCK HERE
+        MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB
+
+        if attachment and attachment.size > MAX_UPLOAD_SIZE:
+            return Response(
+                {"error": "File too large. Max allowed size is 10MB."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # --- Extract attachment text ---
         attachment_name = ''
         attachment_content_type = ''
@@ -147,10 +172,9 @@ class SendMessageAPIView(APIView):
                 attachment_content_type = getattr(attachment, 'content_type', '')
 
                 file_bytes = attachment.read()
-                try:
-                    attachment.seek(0)
-                except Exception:
-                    pass
+
+                # Rebuild clean file object for saving (IMPORTANT for Azure)
+                attachment = ContentFile(file_bytes, name=attachment_name)
 
                 lower = (attachment_name or '').lower()
                 ct = (attachment_content_type or '').lower()
@@ -197,7 +221,11 @@ class SendMessageAPIView(APIView):
                     try:
                         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
                         pages = []
-                        for p in reader.pages:
+                        MAX_PDF_PAGES = 5  # VERY IMPORTANT (fast + safe)
+
+                        for i, p in enumerate(reader.pages):
+                            if i >= MAX_PDF_PAGES:
+                                break
                             try:
                                 pages.append(p.extract_text() or '')
                             except Exception:
@@ -234,8 +262,10 @@ class SendMessageAPIView(APIView):
             logger.exception("Attachment extraction failed")
             extracted_text = ''
 
-        if extracted_text and len(extracted_text) > CHARACTER_LIMIT:
-            extracted_text = Truncator(extracted_text).chars(CHARACTER_LIMIT, truncate='...')
+        MAX_CHAR_FOR_GPT = 6000  # ~2000 tokens safe
+
+        if extracted_text:
+            extracted_text = extracted_text[:MAX_CHAR_FOR_GPT]
 
         # --- Save user message ---
         user_msg = Message.objects.create(
@@ -253,7 +283,7 @@ class SendMessageAPIView(APIView):
         if system_prompt:
             messages_payload.append({'role': 'system', 'content': system_prompt})
 
-        recent_messages = chat.messages.all().order_by('-created_at')[:20][::-1]
+        recent_messages = chat.messages.all().order_by('-created_at')[:6][::-1]
         for m in recent_messages:
             base_content = m.content or ''
             if m.attachment:
@@ -274,6 +304,7 @@ class SendMessageAPIView(APIView):
             })
 
         logger.debug("OpenAI messages_payload keys: %s", [m.get('role') for m in messages_payload])
+        messages_payload = trim_messages_by_chars(messages_payload, max_chars=12000)
 
         # --- Model, temp, max_tokens ---
         user_setting = getattr(user, 'openai_setting', None)
@@ -291,35 +322,50 @@ class SendMessageAPIView(APIView):
             from openai import OpenAI
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
 
-            resp = client.responses.create(
-                model=model,
-                input=messages_payload,
-                instructions=system_prompt or None,
-                tools=[{"type": "web_search"}],
-                temperature=temperature,
-                max_output_tokens=max_tokens,
+            def event_stream():
+                full_text = ""
+                usage_data = {}
+
+                with client.responses.stream(
+                    model=model,
+                    input=messages_payload,
+                    instructions=system_prompt or None,
+                    tools=[{"type": "web_search"}],
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ) as stream:
+
+                    for event in stream:
+                        if event.type == "response.output_text.delta":
+                            delta = event.delta
+                            full_text += delta
+                            yield delta  # 🔥 send chunk immediately
+
+                        elif event.type == "response.completed":
+                            response = stream.get_final_response()
+                            if hasattr(response, "usage") and response.usage:
+                                usage_data = (
+                                    response.usage.model_dump()
+                                    if hasattr(response.usage, "model_dump")
+                                    else {}
+                                )
+
+                # ✅ Save after stream finishes
+                Message.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=full_text,
+                    metadata={'openai_usage': usage_data}
+                )
+
+            return StreamingHttpResponse(
+                event_stream(),
+                content_type="text/plain",
             )
-
-            assistant_text = resp.output_text
-            actual_model = resp.model
-            usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
-            
-            logger.warning("ACTUAL MODEL USED: %s", actual_model)
-
-            assistant_msg = Message.objects.create(
-                chat=chat,
-                role='assistant',
-                content=assistant_text,
-                metadata={'openai_usage': usage}
-            )
-
-            serializer = MessageSerializer(assistant_msg, context={'request': request})
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
-            logger.exception("OpenAI call failed: %s", e)
+            logger.exception("OpenAI streaming failed: %s", e)
             return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
-
 
 # ====================== EDIT & RESEND ======================
 class EditAndResendAPIView(APIView):
@@ -392,16 +438,60 @@ class EditAndResendAPIView(APIView):
                 from openai import OpenAI
                 client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
 
-                resp = client.responses.create(
-                    model=model,
-                    input=messages_payload,
-                    instructions=system_prompt or None,
-                    tools=[{"type": "web_search"}],
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
+                def event_stream():
+                    full_text = ""
+                    usage_data = {}
+
+                    with client.responses.stream(
+                        model=model,
+                        input=messages_payload,
+                        instructions=system_prompt or None,
+                        tools=[{"type": "web_search"}],
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ) as stream:
+
+                        for event in stream:
+                            if event.type == "response.output_text.delta":
+                                delta = event.delta
+                                full_text += delta
+                                yield delta
+
+                            elif event.type == "response.completed":
+                                response = stream.get_final_response()
+                                if hasattr(response, "usage") and response.usage:
+                                    usage_data = (
+                                        response.usage.model_dump()
+                                        if hasattr(response.usage, "model_dump")
+                                        else {}
+                                    )
+
+                    # ✅ Save after stream completes
+                    Message.objects.create(
+                        chat=chat,
+                        role='assistant',
+                        content=full_text,
+                        metadata={
+                            "openai_usage": usage_data,
+                            "replaced_by_edit_of": msg.pk
+                        }
+                    )
+
+                    # After stream ends → save full assistant message
+                    assistant_msg = Message.objects.create(
+                        chat=chat,
+                        role='assistant',
+                        content=full_text,
+                    )
+
+                return StreamingHttpResponse(
+                    event_stream(),
+                    content_type="text/plain"
                 )
 
-                assistant_text = getattr(resp, 'output_text', '') or ''
+            except Exception as e:
+                logger.exception("OpenAI streaming failed: %s", e)
+                return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
                 usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
 
                 assistant_msg = chat.messages.filter(role='assistant', created_at__gt=msg.created_at).order_by('created_at').first()
