@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
 from .models import Chat, Message, UserOpenAISetting
-from .serializers import ChatSerializer, MessageSerializer, UserOpenAISettingSerializer
+from .serializers import ChatSerializer, MessageSerializer, UserOpenAISettingSerializer, ChatNameSerializer
 from .permissions import IsOwner
 import openai
 from django.utils.text import Truncator
@@ -584,3 +584,12 @@ class ExportLatestAssistantMessageAPIView(APIView):
         )
 
         return response    
+    
+class ChatNameListAPIView(generics.ListAPIView):
+    serializer_class = ChatNameSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Chat.objects.filter(
+            owner=self.request.user
+        ).order_by('-updated_at').only('id', 'title', 'created_at', 'updated_at')

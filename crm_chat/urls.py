@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import (
 ChatListCreateAPIView, ChatRetrieveAPIView,
-MessageListAPIView, SendMessageAPIView, DeleteChatAPIView, UserOpenAISettingAPIView, EditAndResendAPIView, ExportLatestAssistantMessageAPIView
+MessageListAPIView, SendMessageAPIView, DeleteChatAPIView, UserOpenAISettingAPIView, EditAndResendAPIView, ExportLatestAssistantMessageAPIView, ChatNameListAPIView
 )
 
 urlpatterns = [
@@ -14,4 +14,5 @@ path('chats/<int:chat_pk>/delete/', DeleteChatAPIView.as_view(), name='chat-dele
 # path('chats/delete-bulk/', BulkDeleteChatsAPIView.as_view(), name='chat-delete-bulk'),
 path('user/openai-settings/', UserOpenAISettingAPIView.as_view(), name='user-openai-settings'),
 path('chats/<int:chat_pk>/export/', ExportLatestAssistantMessageAPIView.as_view(), name='export-latest-assistant-message'),
+path('chats/names/', ChatNameListAPIView.as_view(), name='chat-name-list'),
 ]
