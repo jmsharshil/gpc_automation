@@ -24,6 +24,9 @@ urlpatterns = [
     path("auth/", include("user_auth.urls")),
     path('api/v1/', include('api.urls')),
     path('api/v1/', include("crm_chat.urls")),
+    path('api/v1/transactions/', include("transactions.urls")),
+    path('api/v1/audit/', include("audit.urls")),
+    
 ]
 if settings.DEBUG and not settings.USE_AZURE_MEDIA:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
