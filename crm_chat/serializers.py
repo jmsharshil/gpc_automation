@@ -83,3 +83,10 @@ class UserOpenAISettingSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserOpenAISetting
         fields = ('default_model', 'temperature', 'max_tokens', 'use_rag_for_documents', 'max_context_chunks')
+class ChatNameSerializer(serializers.ModelSerializer):
+    created_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
+    updated_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
+    
+    class Meta:
+        model = Chat
+        fields = ["id", "title", "created_at", "updated_at"]

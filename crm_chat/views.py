@@ -606,7 +606,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils.crypto import get_random_string
 from .models import Chat, Message, UserOpenAISetting, DocumentChunk, DocumentProcessing
-from .serializers import ChatSerializer, MessageSerializer, UserOpenAISettingSerializer
+from .serializers import ChatSerializer, MessageSerializer, UserOpenAISettingSerializer, ChatNameSerializer
 from .permissions import IsOwner
 from .rag_utils import (
     extract_text_from_pdf, split_into_chunks, get_embeddings,
@@ -1396,3 +1396,11 @@ class StreamingChatAPIView(APIView):
         response['Cache-Control'] = 'no-cache'
         response['X-Accel-Buffering'] = 'no'  # Disable Nginx buffering
         return response
+class ChatNameListAPIView(generics.ListAPIView):
+    serializer_class = ChatNameSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Chat.objects.filter(
+            owner=self.request.user
+        ).order_by('-updated_at').only('id', 'title', 'created_at', 'updated_at')
