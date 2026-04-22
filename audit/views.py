@@ -177,16 +177,31 @@ def cosine_similarity(a, b):
  
 def get_queries_from_request(data) -> list:
     """
-    Extracts queries without splitting on commas.
-    Accepts repeated form-data keys OR newline-separated single string.
+    Extracts queries without splitting on commas or single newlines.
+ 
+    A single query may contain multiple paragraphs (separated by \\n\\n or \\n).
+    We must never split WITHIN a query — only BETWEEN separate queries.
+ 
+    Rules:
+      - Repeated form-data keys (recommended): each key = one complete query.
+        Paragraphs inside a single key value are preserved as-is.
+          queries=First question, with a comma\\nand a second line still part of query 1
+          queries=Second question entirely separate
+        → ["First question, with a comma\\nand a second line still part of query 1",
+           "Second question entirely separate"]
+ 
+      - Single string fallback (JSON body or single form field):
+        Split ONLY on double-newline (\\n\\n) — paragraph boundary = query boundary.
+        Single newlines within a paragraph are kept intact.
+          "Question one paragraph one\\nstill question one\\n\\nQuestion two starts here"
+        → ["Question one paragraph one\\nstill question one", "Question two starts here"]
     """
     if hasattr(data, "getlist"):
         values = data.getlist("queries")
         if values:
-            result = []
-            for v in values:
-                result.extend([q.strip() for q in v.split("\n") if q.strip()])
-            return result
+            # Each repeated key = one query. Strip surrounding whitespace only.
+            # Do NOT split on \n — a query can have multiple lines/paragraphs.
+            return [v.strip() for v in values if v.strip()]
  
     value = data.get("queries")
     if not value:
@@ -194,7 +209,11 @@ def get_queries_from_request(data) -> list:
     if isinstance(value, list):
         return [str(q).strip() for q in value if str(q).strip()]
     if isinstance(value, str):
-        return [q.strip() for q in value.split("\n") if q.strip()]
+        # Split on double-newline only — paragraph = query separator.
+        # Single \n within a query is preserved.
+        import re
+        parts = re.split(r'\n{2,}', value)
+        return [q.strip() for q in parts if q.strip()]
     return []
  
  
@@ -497,7 +516,7 @@ class RunAIScreenStreamView(APIView):
                     print(f"DB search error: {e}")
  
                 if db_answer:
-                    yield _sse("query_source", {"source": "DATABASE"})
+                    yield _sse("query_source", {"source": "Database"})
                     yield _sse("query_chunk",  {"text": db_answer})
                     yield _sse("query_done",   {"index": idx + 1})
                     ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
@@ -517,22 +536,87 @@ class RunAIScreenStreamView(APIView):
                     f"{i+1}. {chunk}" for i, chunk in enumerate(top_chunks)
                 ) if has_doc_context else ""
  
-                # ── Source label ──────────────────────────────────────────────
-                if has_doc_context:
-                    source = "Document"
-                elif note_context:
-                    source = "Notes"
-                else:
-                    source = "AI Generated"
+                # ── Source attribution — two-step approach ────────────────────
+                #
+                # FIX: The old code labelled source BEFORE the LLM ran, based
+                # only on what context was non-empty. This caused "NOTES" to
+                # appear even when notes were just tone/format guidance and the
+                # LLM actually answered from industry knowledge.
+                #
+                # New approach:
+                #   Step A — non-streaming call: ask LLM to declare which source
+                #            it will use (DOCUMENT / NOTES / LLM_FALLBACK).
+                #            Notes role is explicitly defined as guidance only.
+                #   Step B — emit query_source with the declared value.
+                #   Step C — streaming call: generate the actual answer.
+                #
+                # Notes are passed to BOTH calls so the LLM can use them for
+                # tone/format/length guidance, but they are not counted as a
+                # substantive source unless they actually contain the answer.
  
+                source_prompt = f"""You are a professional audit assistant.
+ 
+You have been given a QUESTION and optionally a DOCUMENT CONTEXT and NOTES.
+ 
+NOTES are guidance only — they may specify tone, format, length, or background context.
+They are NOT the primary source of an answer unless they explicitly contain the answer.
+ 
+Your task right now is ONLY to decide which source the answer will primarily come from.
+ 
+Reply with exactly one of these three words and nothing else:
+  DOCUMENT       — if DOCUMENT CONTEXT contains relevant information to answer the question
+  NOTES          — if NOTES explicitly contain the answer (not just formatting guidance)
+  LLM_FALLBACK   — if neither document nor notes contain the answer
+ 
+QUESTION:
+{query}
+ 
+NOTES:
+{note_context or "(none provided)"}
+ 
+DOCUMENT CONTEXT:
+{context_text or "(no document uploaded for this request)"}
+ 
+Reply with one word only: DOCUMENT, NOTES, or LLM_FALLBACK"""
+ 
+                # Step A: classify source (non-streaming, fast)
+                source = "LLM_FALLBACK"  # safe default
+                try:
+                    src_response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": source_prompt}],
+                        temperature=0.0,
+                        max_tokens=5,
+                    )
+                    raw = src_response.choices[0].message.content.strip().upper()
+                    if "DOCUMENT" in raw:
+                        source = "Document"
+                    elif "NOTES" in raw:
+                        source = "Notes"
+                    else:
+                        source = "AI Generated"
+                except Exception as e:
+                    print(f"Source classification error: {e}")
+                    # Fall back to heuristic if classification call fails
+                    if has_doc_context:
+                        source = "Document"
+                    elif note_context:
+                        source = "Notes"
+                    else:
+                        source = "AI Generated"
+ 
+                # Step B: emit source before streaming answer
                 yield _sse("query_source", {"source": source})
  
-                prompt = f"""You are a professional audit assistant. Follow this STRICT priority order:
+                # Step C: stream the actual answer
+                answer_prompt = f"""You are a professional audit assistant. Follow this STRICT priority order:
  
 1. DOCUMENT CONTEXT — if provided and relevant, base your answer primarily on this.
-2. NOTES — use if they provide relevant audit context.
-3. INDUSTRY STANDARD — only if neither document nor notes have sufficient information.
-   If using this fallback, start your answer with: "Based on industry-standard audit practices:"
+2. NOTES — use notes for tone, format, and length guidance. Use them as a substantive
+   source only if they explicitly contain information that answers the question.
+3. INDUSTRY STANDARD — if neither document nor notes contain the answer, provide a
+   professional, industry-standard audit answer. Start with:
+   "Based on industry-standard audit practices:"
  
 QUESTION:
 {query}
@@ -547,14 +631,13 @@ INSTRUCTIONS:
 - Be precise, professional, and thorough.
 - Do NOT hallucinate. If unsure, say so explicitly.
 - If using document context, cite the relevant section.
-- If using notes, acknowledge that.
 - If falling back to industry standards, clearly state it at the start.
 """
  
                 try:
                     response = client.chat.completions.create(
                         model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": answer_prompt}],
                         temperature=0.3,
                         stream=True,
                     )
