@@ -13,6 +13,9 @@ class TransactionAdmin(admin.ModelAdmin):
         "geography",
         "primary_industry",
         "created_at",
+        "target_stock_premium_1d",
+        "target_stock_premium_1w",
+        "target_stock_premium_1m",
     )
 
     list_filter = (
@@ -54,6 +57,9 @@ class TransactionAdmin(admin.ModelAdmin):
                 "total_transaction_value_usd",
                 "implied_ev_usd",
                 "percent_sought",
+                "target_stock_premium_1d",
+                "target_stock_premium_1w",
+                "target_stock_premium_1m",
             )
         }),
         ("Parties", {

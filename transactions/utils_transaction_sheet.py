@@ -100,6 +100,16 @@ def process_transaction_excel(file, uploaded_by=None, save_file_to_job=False):
                 percent_sought=to_decimal(
                     safe_get(row_dict, "Percent Sought (%)")
                 ),
+                
+                target_stock_premium_1d=to_decimal(
+                    safe_get(row_dict, "Target Stock Premium - 1 Day Prior (%)")
+                ),
+                target_stock_premium_1w=to_decimal(
+                    safe_get(row_dict, "Target Stock Premium - 1 Week Prior (%)")
+                ),
+                target_stock_premium_1m=to_decimal(
+                    safe_get(row_dict, "Target Stock Premium - 1 Month Prior (%)")
+                ),
 
                 comments=safe_get(row_dict, "Transaction Comments"),
 

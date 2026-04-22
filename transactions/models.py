@@ -24,6 +24,10 @@ class Transaction(models.Model):
 
     percent_sought = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
 
+    target_stock_premium_1d = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+    target_stock_premium_1w = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+    target_stock_premium_1m = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+
     comments = models.TextField(null=True, blank=True)
 
     implied_ev_usd = models.DecimalField(max_digits=30, decimal_places=6, null=True, blank=True)
