@@ -151,9 +151,6 @@ class DashboardStatsView(APIView):
 # ─────────────────────────────────────────────────────────────
  
 DB_SIMILARITY_THRESHOLD  = 0.85
-# ↓ FIXED: was 0.75 — too high for text-embedding-3-small on domain text.
-#   Real relevant chunks typically score 0.40–0.65. 0.40 catches them all
-#   while still filtering genuinely unrelated content (scores < 0.30).
 DOC_SIMILARITY_THRESHOLD = 0.40
  
  
@@ -180,39 +177,23 @@ def cosine_similarity(a, b):
  
 def get_queries_from_request(data) -> list:
     """
-    FIX: Extracts queries WITHOUT splitting on commas.
- 
-    Accepts two formats:
-      1. Repeated keys (recommended):
-            queries=Query one&queries=Query two, with a comma inside
-         → Django gives request.data.getlist("queries") = ["Query one", "Query two, with a comma inside"]
- 
-      2. Newline-separated single string (fallback):
-            queries=Query one\nQuery two, with a comma inside
-         → Split on newlines only, never commas.
- 
-    This means a query like:
-      "In the footnote on the IPO value, it is noted that... Wouldn't the preferred holder..."
-    will NEVER be split — commas inside a query are safe.
+    Extracts queries without splitting on commas.
+    Accepts repeated form-data keys OR newline-separated single string.
     """
-    # Try getlist first (handles repeated form-data keys like queries[])
     if hasattr(data, "getlist"):
         values = data.getlist("queries")
         if values:
-            # Each value might itself be newline-separated — flatten those
             result = []
             for v in values:
                 result.extend([q.strip() for q in v.split("\n") if q.strip()])
             return result
  
-    # Fallback for JSON body
     value = data.get("queries")
     if not value:
         return []
     if isinstance(value, list):
         return [str(q).strip() for q in value if str(q).strip()]
     if isinstance(value, str):
-        # Split on newlines ONLY — never on commas
         return [q.strip() for q in value.split("\n") if q.strip()]
     return []
  
@@ -259,19 +240,27 @@ def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARI
  
  
 # ─────────────────────────────────────────────────────────────
-# Document chunk search — fixed threshold
+# Document chunk search — scoped to current job only
+# FIX: Pass job_id so we ONLY search chunks uploaded in this request.
+#      Chunks from previous requests are completely invisible.
 # ─────────────────────────────────────────────────────────────
  
-def get_relevant_chunks(query_embedding: list, top_k: int = 5, threshold: float = DOC_SIMILARITY_THRESHOLD):
+def get_relevant_chunks(query_embedding: list, job_id: str, top_k: int = 5, threshold: float = DOC_SIMILARITY_THRESHOLD):
     """
-    Returns top_k chunks scoring >= threshold.
-    With threshold=0.40, genuinely relevant audit content from uploaded
-    documents will be captured. Scores < 0.30 are noise and stay filtered out.
+    Searches ONLY the DocumentChunk rows that belong to this specific job_id.
+    This prevents chunks from previous requests from leaking into new queries.
     """
-    chunks = DocumentChunk.objects.filter(status="completed")[:2000]
-    query_vec = np.array(query_embedding)
+    chunks = DocumentChunk.objects.filter(
+        status="completed",
+        job_id=job_id          # ← scoped to this request only
+    )[:2000]
  
+    if not chunks:
+        return []
+ 
+    query_vec = np.array(query_embedding)
     scored = []
+ 
     for chunk in chunks:
         chunk_vec = np.array(chunk.embedding)
         denom = np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec)
@@ -286,16 +275,15 @@ def get_relevant_chunks(query_embedding: list, top_k: int = 5, threshold: float 
  
  
 # ─────────────────────────────────────────────────────────────
-# File processing — SYNCHRONOUS within the stream
-# FIX: Files are now fully processed BEFORE queries are answered,
-# so document chunks exist in DB when get_relevant_chunks() is called.
+# File processing — stores job_id on every chunk
 # ─────────────────────────────────────────────────────────────
  
 def process_files_for_job(job_id: str, file_texts: list):
     """
-    Processes and embeds all uploaded file chunks.
-    Updates ProcessingJob + ProcessingJobFile as it goes so the frontend
-    can poll /processing-status/?job_id=X for live progress.
+    Embeds and stores chunks tagged with job_id.
+    Note: content_hash dedup is intentionally removed here so the same
+    file uploaded in two different requests each gets its own scoped chunks.
+    If storage is a concern, dedup can be re-added at query time instead.
     """
     try:
         ProcessingJob.objects.filter(job_id=job_id).update(current_phase="processing_files")
@@ -317,18 +305,21 @@ def process_files_for_job(job_id: str, file_texts: list):
  
             for chunk in chunks:
                 try:
+                    emb = client.embeddings.create(
+                        model="text-embedding-3-small", input=chunk
+                    )
                     content_hash = hashlib.sha256(chunk.encode()).hexdigest()
-                    if not DocumentChunk.objects.filter(content_hash=content_hash).exists():
-                        emb = client.embeddings.create(
-                            model="text-embedding-3-small", input=chunk
-                        )
-                        DocumentChunk.objects.create(
-                            content=chunk,
-                            embedding=emb.data[0].embedding,
-                            status="completed",
-                            content_hash=content_hash,
-                            source=file_name,
-                        )
+ 
+                    # Store chunk tagged with job_id — no global dedup
+                    DocumentChunk.objects.create(
+                        content=chunk,
+                        embedding=emb.data[0].embedding,
+                        status="completed",
+                        content_hash=content_hash,
+                        source=file_name,
+                        job_id=job_id,           # ← tag with job
+                    )
+ 
                     ProcessingJobFile.objects.filter(id=job_file.id).update(
                         processed_chunks=models.F("processed_chunks") + 1
                     )
@@ -352,6 +343,43 @@ def process_files_for_job(job_id: str, file_texts: list):
             error_message=str(e),
         )
         raise
+ 
+ 
+# ─────────────────────────────────────────────────────────────
+# Cleanup helper — delete chunks for a completed job
+# Call this if you want to keep the DB lean after a job finishes.
+# ─────────────────────────────────────────────────────────────
+ 
+def cleanup_job_chunks(job_id: str):
+    deleted, _ = DocumentChunk.objects.filter(job_id=job_id).delete()
+    print(f"[cleanup] Deleted {deleted} chunks for job {job_id}")
+ 
+ 
+# ─────────────────────────────────────────────────────────────
+# Notes helper
+# ─────────────────────────────────────────────────────────────
+ 
+def _prepare_notes(notes: str) -> str:
+    if not notes:
+        return ""
+    if len(notes) <= 15000:
+        return notes
+    note_chunks = chunk_text(notes, chunk_size=12000, overlap=500)
+    summaries   = []
+    for nc in note_chunks:
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content":
+                    f"Summarize the following audit notes concisely, retaining all key facts:\n\n{nc}"
+                }],
+                temperature=0.2,
+                max_tokens=1000,
+            )
+            summaries.append(r.choices[0].message.content)
+        except Exception as e:
+            print(f"Note summarization error: {e}")
+    return "\n\n".join(summaries)
  
  
 # ─────────────────────────────────────────────────────────────
@@ -384,43 +412,8 @@ class FilterRecordsView(APIView):
 # ─────────────────────────────────────────────────────────────
  
 class RunAIScreenStreamView(APIView):
-    """
-    POST /run-ai-stream/   (multipart/form-data)
- 
-    Parameters
-    ----------
-    queries     Repeat this key for each question — safe for commas inside queries.
-                  queries=What is the audit risk?
-                  queries=In the footnote on IPO value, it is noted..., wouldn't the preferred holder...?
-                  queries=Third question here
- 
-                OR send as a newline-separated single value:
-                  queries=Question one\nQuestion two\nQuestion three
- 
-    notes       Optional free-text context (see notes section below).
- 
-    files[]     Optional uploaded documents (PDF / DOCX / TXT).
- 
-    How notes work
-    --------------
-    Notes are additional context YOU provide to the AI — things that are
-    not in the database and not in the uploaded documents.
- 
-    Examples of what to write in notes:
-      - "This valuation is for Series H-1 preferred stock. The company's
-         latest 409A was done in Q3 2024. Focus on OPM methodology."
-      - "The auditor flagged concerns about the GTM approach and comparability
-         of transactions. Consider lack of meaningful comparable transactions."
-      - "Client is Neurelis Inc. Use EY audit standards. Preferred return
-         rate is 12.5%. Liquidation preference should be respected."
- 
-    Notes are injected directly into the prompt alongside document context.
-    They are meant for short-to-medium guidance (under ~15,000 characters).
-    For very large notes, they are auto-summarized in batches before use.
-    """
  
     def post(self, request):
-        # FIX: Use get_queries_from_request — no comma-splitting
         queries = get_queries_from_request(request.data)
         notes   = request.data.get("notes", "")
         files   = request.FILES.getlist("files")
@@ -428,14 +421,16 @@ class RunAIScreenStreamView(APIView):
         if not queries:
             return Response({"error": "At least one query is required."}, status=400)
  
-        # Extract file texts upfront (before any async work)
         file_texts = []
         for f in files:
             text = extract_file_text(f)
             if text:
                 file_texts.append((f.name, text))
  
-        # Create job record
+        # files_uploaded_this_request is the single source of truth.
+        # If False, document search is completely skipped — no DB lookup at all.
+        files_uploaded_this_request = len(file_texts) > 0
+ 
         job = ProcessingJob.objects.create(
             status=ProcessingJob.STATUS_PROCESSING,
             total_files=len(file_texts),
@@ -450,14 +445,12 @@ class RunAIScreenStreamView(APIView):
         def generate():
             yield _sse("job_created", {"job_id": job_id, "total_queries": len(queries)})
  
-            # ── STEP 1: Process files FIRST (synchronous in the stream) ───────
-            # FIX: Was background thread before — chunks didn't exist yet when
-            # queries ran. Now we process files inline so they're in DB before
-            # get_relevant_chunks() is called.
-            if file_texts:
+            # ── Process files synchronously BEFORE answering queries ──────────
+            # Only runs if files were attached in THIS request.
+            if files_uploaded_this_request:
                 yield _sse("phase", {
                     "phase": "processing_files",
-                    "message": f"Embedding {len(file_texts)} file(s) — this may take a moment for large documents…",
+                    "message": f"Embedding {len(file_texts)} file(s)…",
                 })
                 try:
                     process_files_for_job(job_id, file_texts)
@@ -467,16 +460,15 @@ class RunAIScreenStreamView(APIView):
                     })
                 except Exception as e:
                     yield _sse("error", {"message": f"File processing failed: {e}"})
-                    # Continue anyway — AI can still answer from DB + notes
+                    # Don't abort — continue with DB + notes only
  
-            # ── STEP 2: Answer queries (files are guaranteed in DB now) ────────
+            # ── Answer queries ────────────────────────────────────────────────
             ProcessingJob.objects.filter(job_id=job_id).update(current_phase="answering_queries")
             yield _sse("phase", {
                 "phase": "answering_queries",
                 "message": f"Answering {len(queries)} query/queries…",
             })
  
-            # Pre-process notes once (outside query loop — same for all queries)
             note_context = _prepare_notes(notes)
  
             for idx, query in enumerate(queries):
@@ -490,7 +482,6 @@ class RunAIScreenStreamView(APIView):
                     "total": len(queries),
                 })
  
-                # Embed query once — reused for DB + doc search
                 try:
                     query_embedding = _embed(query)
                 except Exception as e:
@@ -498,7 +489,7 @@ class RunAIScreenStreamView(APIView):
                     yield _sse("query_done", {"index": idx + 1})
                     continue
  
-                # ── DB search ─────────────────────────────────────────────────
+                # ── Step 1: DB search ─────────────────────────────────────────
                 db_answer = None
                 try:
                     db_answer = find_similar_db_answer(query_embedding)
@@ -512,12 +503,14 @@ class RunAIScreenStreamView(APIView):
                     ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
                     continue
  
-                # ── Document search ───────────────────────────────────────────
+                # ── Step 2: Document search — ONLY if files were in this request
                 top_chunks = []
-                try:
-                    top_chunks = get_relevant_chunks(query_embedding)
-                except Exception as e:
-                    print(f"Chunk search error: {e}")
+                if files_uploaded_this_request:
+                    try:
+                        top_chunks = get_relevant_chunks(query_embedding, job_id=job_id)
+                    except Exception as e:
+                        print(f"Chunk search error: {e}")
+                # If no files attached → top_chunks stays [] → source = NOTES or LLM_FALLBACK
  
                 has_doc_context = len(top_chunks) > 0
                 context_text = "\n\n".join(
@@ -534,12 +527,11 @@ class RunAIScreenStreamView(APIView):
  
                 yield _sse("query_source", {"source": source})
  
-                # ── Build prompt ──────────────────────────────────────────────
                 prompt = f"""You are a professional audit assistant. Follow this STRICT priority order:
  
 1. DOCUMENT CONTEXT — if provided and relevant, base your answer primarily on this.
 2. NOTES — use if they provide relevant audit context.
-3. INDUSTRY STANDARD — only if neither document nor notes have sufficient information. 
+3. INDUSTRY STANDARD — only if neither document nor notes have sufficient information.
    If using this fallback, start your answer with: "Based on industry-standard audit practices:"
  
 QUESTION:
@@ -549,7 +541,7 @@ NOTES:
 {note_context or "(none provided)"}
  
 DOCUMENT CONTEXT:
-{context_text or "(no relevant content found in uploaded documents)"}
+{context_text or "(no document uploaded for this request)"}
  
 INSTRUCTIONS:
 - Be precise, professional, and thorough.
@@ -576,7 +568,13 @@ INSTRUCTIONS:
                 yield _sse("query_done", {"index": idx + 1})
                 ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
  
-            # ── Mark complete ─────────────────────────────────────────────────
+            # ── Cleanup this job's chunks from DB (keep DB lean) ──────────────
+            if files_uploaded_this_request:
+                try:
+                    cleanup_job_chunks(job_id)
+                except Exception as e:
+                    print(f"Chunk cleanup error: {e}")
+ 
             ProcessingJob.objects.filter(job_id=job_id).update(
                 status=ProcessingJob.STATUS_COMPLETED,
                 current_phase="done",
@@ -586,31 +584,6 @@ INSTRUCTIONS:
             yield _sse("job_done", {"job_id": job_id})
  
         return StreamingHttpResponse(generate(), content_type="text/event-stream")
- 
- 
-def _prepare_notes(notes: str) -> str:
-    """Handles large notes — summarizes in batches if over 15k chars."""
-    if not notes:
-        return ""
-    if len(notes) <= 15000:
-        return notes
- 
-    note_chunks = chunk_text(notes, chunk_size=12000, overlap=500)
-    summaries   = []
-    for nc in note_chunks:
-        try:
-            r = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content":
-                    f"Summarize the following audit notes concisely, retaining all key facts:\n\n{nc}"
-                }],
-                temperature=0.2,
-                max_tokens=1000,
-            )
-            summaries.append(r.choices[0].message.content)
-        except Exception as e:
-            print(f"Note summarization error: {e}")
-    return "\n\n".join(summaries)
  
  
 # ─────────────────────────────────────────────────────────────
