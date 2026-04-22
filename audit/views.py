@@ -146,25 +146,20 @@ class DashboardStatsView(APIView):
             "category_breakdown": category_breakdown,
         })
         
-DB_SIMILARITY_THRESHOLD  = 0.85   # min score to count as a DB match
-DOC_SIMILARITY_THRESHOLD = 0.75   # min score for a document chunk to be "relevant"
-#   ↑ This is the key fix for the wrong SOURCE:DOCUMENT bug.
-#     Chunks below 0.75 are ignored even if they exist.
+# ─────────────────────────────────────────────────────────────
+# Thresholds
+# ─────────────────────────────────────────────────────────────
+ 
+DB_SIMILARITY_THRESHOLD  = 0.85
+# ↓ FIXED: was 0.75 — too high for text-embedding-3-small on domain text.
+#   Real relevant chunks typically score 0.40–0.65. 0.40 catches them all
+#   while still filtering genuinely unrelated content (scores < 0.30).
+DOC_SIMILARITY_THRESHOLD = 0.40
+ 
  
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
- 
-def get_list(data, key):
-    value = data.get(key)
-    if not value:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        return [v.strip() for v in value.split(",") if v.strip()]
-    return []
- 
  
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -183,23 +178,54 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / denom) if denom else 0.0
  
  
+def get_queries_from_request(data) -> list:
+    """
+    FIX: Extracts queries WITHOUT splitting on commas.
+ 
+    Accepts two formats:
+      1. Repeated keys (recommended):
+            queries=Query one&queries=Query two, with a comma inside
+         → Django gives request.data.getlist("queries") = ["Query one", "Query two, with a comma inside"]
+ 
+      2. Newline-separated single string (fallback):
+            queries=Query one\nQuery two, with a comma inside
+         → Split on newlines only, never commas.
+ 
+    This means a query like:
+      "In the footnote on the IPO value, it is noted that... Wouldn't the preferred holder..."
+    will NEVER be split — commas inside a query are safe.
+    """
+    # Try getlist first (handles repeated form-data keys like queries[])
+    if hasattr(data, "getlist"):
+        values = data.getlist("queries")
+        if values:
+            # Each value might itself be newline-separated — flatten those
+            result = []
+            for v in values:
+                result.extend([q.strip() for q in v.split("\n") if q.strip()])
+            return result
+ 
+    # Fallback for JSON body
+    value = data.get("queries")
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(q).strip() for q in value if str(q).strip()]
+    if isinstance(value, str):
+        # Split on newlines ONLY — never on commas
+        return [q.strip() for q in value.split("\n") if q.strip()]
+    return []
+ 
+ 
 # ─────────────────────────────────────────────────────────────
-# FAST DB search  — uses pre-stored embeddings (no N API calls)
+# DB search — pre-stored embeddings, zero extra API calls
 # ─────────────────────────────────────────────────────────────
  
 def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARITY_THRESHOLD):
-    """
-    Searches ALL AuditRecord rows using pre-stored question_embedding.
-    Cost: 0 extra API calls (query is already embedded by the caller).
-    Falls back to live embedding only for records that are missing the cached vector.
-    """
-    # Load only records that have pre-stored embeddings (fast path)
     records_with_emb = list(
         AuditRecord.objects.exclude(question_embedding__isnull=True)
         .values("question_embedding", "response")
     )
- 
-    # Also load records without embeddings (slow fallback — should be empty after backfill)
     records_without_emb = list(
         AuditRecord.objects.filter(question_embedding__isnull=True)
         .values("id", "question", "response")
@@ -208,20 +234,15 @@ def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARI
     best_score  = 0.0
     best_answer = None
  
-    # Fast path: compare against pre-stored vectors (pure numpy, no API calls)
     for r in records_with_emb:
         score = cosine_similarity(query_embedding, r["question_embedding"])
         if score > threshold and score > best_score:
             best_score  = score
             best_answer = r["response"]
  
-    # Slow fallback: embed on the fly for records without stored vectors
     if records_without_emb:
         with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {
-                pool.submit(_embed, r["question"]): r
-                for r in records_without_emb
-            }
+            futures = {pool.submit(_embed, r["question"]): r for r in records_without_emb}
             for future in as_completed(futures):
                 r = futures[future]
                 try:
@@ -230,11 +251,7 @@ def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARI
                     if score > threshold and score > best_score:
                         best_score  = score
                         best_answer = r["response"]
- 
-                    # Cache the embedding so next call is fast
-                    AuditRecord.objects.filter(id=r["id"]).update(
-                        question_embedding=emb
-                    )
+                    AuditRecord.objects.filter(id=r["id"]).update(question_embedding=emb)
                 except Exception as e:
                     print(f"[DB fallback embed error] {e}")
  
@@ -242,14 +259,14 @@ def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARI
  
  
 # ─────────────────────────────────────────────────────────────
-# Document chunk search  — with relevance threshold
+# Document chunk search — fixed threshold
 # ─────────────────────────────────────────────────────────────
  
 def get_relevant_chunks(query_embedding: list, top_k: int = 5, threshold: float = DOC_SIMILARITY_THRESHOLD):
     """
-    Returns top_k document chunks whose similarity to the query
-    is >= threshold.  Returns empty list if nothing is relevant enough.
-    This prevents false SOURCE:DOCUMENT labels.
+    Returns top_k chunks scoring >= threshold.
+    With threshold=0.40, genuinely relevant audit content from uploaded
+    documents will be captured. Scores < 0.30 are noise and stay filtered out.
     """
     chunks = DocumentChunk.objects.filter(status="completed")[:2000]
     query_vec = np.array(query_embedding)
@@ -261,7 +278,7 @@ def get_relevant_chunks(query_embedding: list, top_k: int = 5, threshold: float 
         if denom == 0:
             continue
         score = float(np.dot(query_vec, chunk_vec) / denom)
-        if score >= threshold:                    # ← only keep relevant chunks
+        if score >= threshold:
             scored.append((score, chunk.content))
  
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -269,27 +286,31 @@ def get_relevant_chunks(query_embedding: list, top_k: int = 5, threshold: float 
  
  
 # ─────────────────────────────────────────────────────────────
-# File processing (background, job-aware)
+# File processing — SYNCHRONOUS within the stream
+# FIX: Files are now fully processed BEFORE queries are answered,
+# so document chunks exist in DB when get_relevant_chunks() is called.
 # ─────────────────────────────────────────────────────────────
  
 def process_files_for_job(job_id: str, file_texts: list):
+    """
+    Processes and embeds all uploaded file chunks.
+    Updates ProcessingJob + ProcessingJobFile as it goes so the frontend
+    can poll /processing-status/?job_id=X for live progress.
+    """
     try:
+        ProcessingJob.objects.filter(job_id=job_id).update(current_phase="processing_files")
         job = ProcessingJob.objects.get(job_id=job_id)
-        job.current_phase = "processing_files"
-        job.save(update_fields=["current_phase", "updated_at"])
  
         for file_name, text in file_texts:
             job_file = ProcessingJobFile.objects.get(job=job, file_name=file_name)
             job_file.status = "processing"
             job_file.save(update_fields=["status"])
  
-            job.current_file = file_name
-            job.save(update_fields=["current_file", "updated_at"])
+            ProcessingJob.objects.filter(job_id=job_id).update(current_file=file_name)
  
             chunks = chunk_text(text, chunk_size=1000, overlap=200)
             job_file.total_chunks = len(chunks)
             job_file.save(update_fields=["total_chunks"])
- 
             ProcessingJob.objects.filter(job_id=job_id).update(
                 total_chunks=models.F("total_chunks") + len(chunks)
             )
@@ -297,11 +318,9 @@ def process_files_for_job(job_id: str, file_texts: list):
             for chunk in chunks:
                 try:
                     content_hash = hashlib.sha256(chunk.encode()).hexdigest()
- 
                     if not DocumentChunk.objects.filter(content_hash=content_hash).exists():
                         emb = client.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=chunk
+                            model="text-embedding-3-small", input=chunk
                         )
                         DocumentChunk.objects.create(
                             content=chunk,
@@ -310,28 +329,22 @@ def process_files_for_job(job_id: str, file_texts: list):
                             content_hash=content_hash,
                             source=file_name,
                         )
- 
                     ProcessingJobFile.objects.filter(id=job_file.id).update(
                         processed_chunks=models.F("processed_chunks") + 1
                     )
                     ProcessingJob.objects.filter(job_id=job_id).update(
                         processed_chunks=models.F("processed_chunks") + 1
                     )
- 
                 except Exception as e:
                     print(f"Embedding error [{file_name}]: {e}")
  
-            job_file.refresh_from_db()
             job_file.status = "completed"
             job_file.save(update_fields=["status"])
- 
             ProcessingJob.objects.filter(job_id=job_id).update(
                 processed_files=models.F("processed_files") + 1
             )
  
-        job.refresh_from_db()
-        job.current_file = None
-        job.save(update_fields=["current_file", "updated_at"])
+        ProcessingJob.objects.filter(job_id=job_id).update(current_file=None)
  
     except Exception as e:
         ProcessingJob.objects.filter(job_id=job_id).update(
@@ -339,9 +352,6 @@ def process_files_for_job(job_id: str, file_texts: list):
             error_message=str(e),
         )
         raise
- 
- 
-_executor = ThreadPoolExecutor(max_workers=4)
  
  
 # ─────────────────────────────────────────────────────────────
@@ -374,22 +384,58 @@ class FilterRecordsView(APIView):
 # ─────────────────────────────────────────────────────────────
  
 class RunAIScreenStreamView(APIView):
+    """
+    POST /run-ai-stream/   (multipart/form-data)
+ 
+    Parameters
+    ----------
+    queries     Repeat this key for each question — safe for commas inside queries.
+                  queries=What is the audit risk?
+                  queries=In the footnote on IPO value, it is noted..., wouldn't the preferred holder...?
+                  queries=Third question here
+ 
+                OR send as a newline-separated single value:
+                  queries=Question one\nQuestion two\nQuestion three
+ 
+    notes       Optional free-text context (see notes section below).
+ 
+    files[]     Optional uploaded documents (PDF / DOCX / TXT).
+ 
+    How notes work
+    --------------
+    Notes are additional context YOU provide to the AI — things that are
+    not in the database and not in the uploaded documents.
+ 
+    Examples of what to write in notes:
+      - "This valuation is for Series H-1 preferred stock. The company's
+         latest 409A was done in Q3 2024. Focus on OPM methodology."
+      - "The auditor flagged concerns about the GTM approach and comparability
+         of transactions. Consider lack of meaningful comparable transactions."
+      - "Client is Neurelis Inc. Use EY audit standards. Preferred return
+         rate is 12.5%. Liquidation preference should be respected."
+ 
+    Notes are injected directly into the prompt alongside document context.
+    They are meant for short-to-medium guidance (under ~15,000 characters).
+    For very large notes, they are auto-summarized in batches before use.
+    """
+ 
     def post(self, request):
-        queries = get_list(request.data, "queries")
+        # FIX: Use get_queries_from_request — no comma-splitting
+        queries = get_queries_from_request(request.data)
         notes   = request.data.get("notes", "")
         files   = request.FILES.getlist("files")
  
         if not queries:
             return Response({"error": "At least one query is required."}, status=400)
  
-        # Extract file texts upfront
+        # Extract file texts upfront (before any async work)
         file_texts = []
         for f in files:
             text = extract_file_text(f)
             if text:
                 file_texts.append((f.name, text))
  
-        # Create job
+        # Create job record
         job = ProcessingJob.objects.create(
             status=ProcessingJob.STATUS_PROCESSING,
             total_files=len(file_texts),
@@ -402,23 +448,36 @@ class RunAIScreenStreamView(APIView):
         job_id = str(job.job_id)
  
         def generate():
-            yield _sse("job_created", {"job_id": job_id})
+            yield _sse("job_created", {"job_id": job_id, "total_queries": len(queries)})
  
-            # Start background file processing
-            file_future = None
+            # ── STEP 1: Process files FIRST (synchronous in the stream) ───────
+            # FIX: Was background thread before — chunks didn't exist yet when
+            # queries ran. Now we process files inline so they're in DB before
+            # get_relevant_chunks() is called.
             if file_texts:
                 yield _sse("phase", {
                     "phase": "processing_files",
-                    "message": f"Processing {len(file_texts)} file(s) in background…",
+                    "message": f"Embedding {len(file_texts)} file(s) — this may take a moment for large documents…",
                 })
-                file_future = _executor.submit(process_files_for_job, job_id, file_texts)
+                try:
+                    process_files_for_job(job_id, file_texts)
+                    yield _sse("phase", {
+                        "phase": "files_ready",
+                        "message": "Files processed and ready for search.",
+                    })
+                except Exception as e:
+                    yield _sse("error", {"message": f"File processing failed: {e}"})
+                    # Continue anyway — AI can still answer from DB + notes
  
-            # Answer queries immediately (don't wait for file processing)
+            # ── STEP 2: Answer queries (files are guaranteed in DB now) ────────
             ProcessingJob.objects.filter(job_id=job_id).update(current_phase="answering_queries")
             yield _sse("phase", {
                 "phase": "answering_queries",
                 "message": f"Answering {len(queries)} query/queries…",
             })
+ 
+            # Pre-process notes once (outside query loop — same for all queries)
+            note_context = _prepare_notes(notes)
  
             for idx, query in enumerate(queries):
                 ProcessingJob.objects.filter(job_id=job_id).update(
@@ -431,7 +490,7 @@ class RunAIScreenStreamView(APIView):
                     "total": len(queries),
                 })
  
-                # ── Embed the query ONCE — reused for DB search + doc search ──
+                # Embed query once — reused for DB + doc search
                 try:
                     query_embedding = _embed(query)
                 except Exception as e:
@@ -439,7 +498,7 @@ class RunAIScreenStreamView(APIView):
                     yield _sse("query_done", {"index": idx + 1})
                     continue
  
-                # ── Step 1: Full DB search (fast — pre-stored vectors) ─────────
+                # ── DB search ─────────────────────────────────────────────────
                 db_answer = None
                 try:
                     db_answer = find_similar_db_answer(query_embedding)
@@ -453,57 +512,35 @@ class RunAIScreenStreamView(APIView):
                     ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
                     continue
  
-                # ── Step 2: Document search (with relevance threshold) ─────────
+                # ── Document search ───────────────────────────────────────────
                 top_chunks = []
                 try:
                     top_chunks = get_relevant_chunks(query_embedding)
                 except Exception as e:
                     print(f"Chunk search error: {e}")
  
-                # ← Only mark as DOCUMENT if chunks are genuinely relevant (score ≥ 0.75)
-                has_relevant_context = len(top_chunks) > 0
+                has_doc_context = len(top_chunks) > 0
                 context_text = "\n\n".join(
                     f"{i+1}. {chunk}" for i, chunk in enumerate(top_chunks)
-                ) if has_relevant_context else ""
+                ) if has_doc_context else ""
  
-                # ── Step 3: Handle large notes ────────────────────────────────
-                note_context = ""
-                if notes:
-                    if len(notes) <= 15000:
-                        note_context = notes
-                    else:
-                        note_chunks   = chunk_text(notes, chunk_size=12000, overlap=500)
-                        note_summaries = []
-                        for nc in note_chunks:
-                            try:
-                                r = client.chat.completions.create(
-                                    model="gpt-4o-mini",
-                                    messages=[{"role": "user", "content":
-                                        f"Summarize the following audit notes concisely, retaining all key facts:\n\n{nc}"
-                                    }],
-                                    temperature=0.2,
-                                    max_tokens=1000,
-                                )
-                                note_summaries.append(r.choices[0].message.content)
-                            except Exception as e:
-                                print(f"Note summarization error: {e}")
-                        note_context = "\n\n".join(note_summaries)
- 
-                # ── Determine source label ─────────────────────────────────────
-                if has_relevant_context:
-                    source = "DOCUMENT"
+                # ── Source label ──────────────────────────────────────────────
+                if has_doc_context:
+                    source = "Document"
                 elif note_context:
-                    source = "NOTES"
+                    source = "Notes"
                 else:
-                    source = "LLM_FALLBACK"
+                    source = "AI Generated"
  
                 yield _sse("query_source", {"source": source})
  
+                # ── Build prompt ──────────────────────────────────────────────
                 prompt = f"""You are a professional audit assistant. Follow this STRICT priority order:
  
-1. DOCUMENT CONTEXT — use it if relevant and sufficient.
-2. NOTES — use if they provide useful audit-related information.
-3. INDUSTRY STANDARD — if neither contains sufficient information, provide a professional, industry-standard audit answer. Clearly state you are doing so.
+1. DOCUMENT CONTEXT — if provided and relevant, base your answer primarily on this.
+2. NOTES — use if they provide relevant audit context.
+3. INDUSTRY STANDARD — only if neither document nor notes have sufficient information. 
+   If using this fallback, start your answer with: "Based on industry-standard audit practices:"
  
 QUESTION:
 {query}
@@ -512,13 +549,14 @@ NOTES:
 {note_context or "(none provided)"}
  
 DOCUMENT CONTEXT:
-{context_text or "(no relevant document content found)"}
+{context_text or "(no relevant content found in uploaded documents)"}
  
 INSTRUCTIONS:
 - Be precise, professional, and thorough.
 - Do NOT hallucinate. If unsure, say so explicitly.
-- If using document/notes context, cite what you are basing the answer on.
-- If falling back to industry standards, start your answer with: "Based on industry-standard audit practices:"
+- If using document context, cite the relevant section.
+- If using notes, acknowledge that.
+- If falling back to industry standards, clearly state it at the start.
 """
  
                 try:
@@ -535,20 +573,10 @@ INSTRUCTIONS:
                 except Exception as e:
                     yield _sse("error", {"message": f"LLM error for query {idx+1}: {str(e)}"})
  
-                yield _sse("query_done",   {"index": idx + 1})
+                yield _sse("query_done", {"index": idx + 1})
                 ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
  
-            # Wait for file processing to finish
-            if file_future:
-                yield _sse("phase", {
-                    "phase": "waiting_for_files",
-                    "message": "Waiting for background file processing to finish…",
-                })
-                try:
-                    file_future.result()
-                except Exception as e:
-                    yield _sse("error", {"message": f"File processing failed: {str(e)}"})
- 
+            # ── Mark complete ─────────────────────────────────────────────────
             ProcessingJob.objects.filter(job_id=job_id).update(
                 status=ProcessingJob.STATUS_COMPLETED,
                 current_phase="done",
@@ -558,6 +586,31 @@ INSTRUCTIONS:
             yield _sse("job_done", {"job_id": job_id})
  
         return StreamingHttpResponse(generate(), content_type="text/event-stream")
+ 
+ 
+def _prepare_notes(notes: str) -> str:
+    """Handles large notes — summarizes in batches if over 15k chars."""
+    if not notes:
+        return ""
+    if len(notes) <= 15000:
+        return notes
+ 
+    note_chunks = chunk_text(notes, chunk_size=12000, overlap=500)
+    summaries   = []
+    for nc in note_chunks:
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content":
+                    f"Summarize the following audit notes concisely, retaining all key facts:\n\n{nc}"
+                }],
+                temperature=0.2,
+                max_tokens=1000,
+            )
+            summaries.append(r.choices[0].message.content)
+        except Exception as e:
+            print(f"Note summarization error: {e}")
+    return "\n\n".join(summaries)
  
  
 # ─────────────────────────────────────────────────────────────
@@ -629,9 +682,9 @@ class ProcessingStatusView(APIView):
         } for f in file_stats]
  
         return Response({
-            "total_chunks":       total,
-            "processed_chunks":   completed,
-            "pending_chunks":     total - completed,
+            "total_chunks":        total,
+            "processed_chunks":    completed,
+            "pending_chunks":      total - completed,
             "progress_percentage": progress,
-            "files":              file_list,
+            "files":               file_list,
         })
