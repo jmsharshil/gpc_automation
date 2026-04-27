@@ -149,9 +149,23 @@ class DashboardStatsView(APIView):
 # ─────────────────────────────────────────────────────────────
 # Thresholds
 # ─────────────────────────────────────────────────────────────
+#
+# text-embedding-3-small cosine similarity on domain-specific audit text:
+#
+#   ≥ 0.82  STRONG  — same concept, very close or exact wording match
+#   ≥ 0.70  PARTIAL — same concept, paraphrased / reworded / incomplete
+#   < 0.70  NOISE   — shares audit vocabulary but different topic entirely
+#                     (e.g. "asset volatility" vs "unsystematic risk premium")
+#
+# The old values (0.75 / 0.40) caused 40-50 noise results because all
+# audit records share domain words (risk, premium, %, assumption, valuation)
+# and easily scored above 0.40 without being topically related.
+#
+DB_STRONG_THRESHOLD  = 0.82   # was 0.75
+DB_PARTIAL_THRESHOLD = 0.70   # was 0.40 — this was the main source of noise
+DB_MAX_RESULTS       = 5      # hard cap: never return more than 5 DB matches
  
-DB_SIMILARITY_THRESHOLD  = 0.85
-DOC_SIMILARITY_THRESHOLD = 0.40
+DOC_SIMILARITY_THRESHOLD = 0.50   # raised from 0.40 for same reason
  
  
 # ─────────────────────────────────────────────────────────────
@@ -199,8 +213,6 @@ def get_queries_from_request(data) -> list:
     if hasattr(data, "getlist"):
         values = data.getlist("queries")
         if values:
-            # Each repeated key = one query. Strip surrounding whitespace only.
-            # Do NOT split on \n — a query can have multiple lines/paragraphs.
             return [v.strip() for v in values if v.strip()]
  
     value = data.get("queries")
@@ -209,8 +221,6 @@ def get_queries_from_request(data) -> list:
     if isinstance(value, list):
         return [str(q).strip() for q in value if str(q).strip()]
     if isinstance(value, str):
-        # Split on double-newline only — paragraph = query separator.
-        # Single \n within a query is preserved.
         import re
         parts = re.split(r'\n{2,}', value)
         return [q.strip() for q in parts if q.strip()]
@@ -218,28 +228,46 @@ def get_queries_from_request(data) -> list:
  
  
 # ─────────────────────────────────────────────────────────────
-# DB search — pre-stored embeddings, zero extra API calls
+# DB search — strict thresholds, hard result cap
 # ─────────────────────────────────────────────────────────────
  
-def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARITY_THRESHOLD):
+def search_db_records(query_embedding: list) -> dict:
+    """
+    Searches ALL AuditRecord rows using pre-stored embeddings.
+ 
+    Scoring:
+        strong  — score >= DB_STRONG_THRESHOLD (0.82): same concept, close wording
+        partial — score in [DB_PARTIAL_THRESHOLD, DB_STRONG_THRESHOLD)
+                  (0.70–0.82): same concept, paraphrased/incomplete
+ 
+    Hard cap: at most DB_MAX_RESULTS (5) total across both tiers, best-first.
+    Records below DB_PARTIAL_THRESHOLD (0.70) are discarded as noise.
+ 
+    Returns {"strong": [...], "partial": [...]} sorted best-score-first.
+    """
     records_with_emb = list(
         AuditRecord.objects.exclude(question_embedding__isnull=True)
-        .values("question_embedding", "response")
+        .values("question_embedding", "serial_no", "question", "response")
     )
     records_without_emb = list(
         AuditRecord.objects.filter(question_embedding__isnull=True)
-        .values("id", "question", "response")
+        .values("id", "serial_no", "question", "response")
     )
  
-    best_score  = 0.0
-    best_answer = None
+    scored = []
  
+    # Fast path: pre-stored vectors — pure numpy, zero API calls
     for r in records_with_emb:
         score = cosine_similarity(query_embedding, r["question_embedding"])
-        if score > threshold and score > best_score:
-            best_score  = score
-            best_answer = r["response"]
+        if score >= DB_PARTIAL_THRESHOLD:
+            scored.append({
+                "score":     score,
+                "serial_no": r["serial_no"],
+                "question":  r["question"],
+                "response":  r["response"],
+            })
  
+    # Slow fallback: records missing embeddings (should be empty after backfill)
     if records_without_emb:
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(_embed, r["question"]): r for r in records_without_emb}
@@ -248,14 +276,25 @@ def find_similar_db_answer(query_embedding: list, threshold: float = DB_SIMILARI
                 try:
                     emb   = future.result()
                     score = cosine_similarity(query_embedding, emb)
-                    if score > threshold and score > best_score:
-                        best_score  = score
-                        best_answer = r["response"]
                     AuditRecord.objects.filter(id=r["id"]).update(question_embedding=emb)
+                    if score >= DB_PARTIAL_THRESHOLD:
+                        scored.append({
+                            "score":     score,
+                            "serial_no": r["serial_no"],
+                            "question":  r["question"],
+                            "response":  r["response"],
+                        })
                 except Exception as e:
                     print(f"[DB fallback embed error] {e}")
  
-    return best_answer
+    # Sort best-first, then enforce hard cap before splitting into tiers
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored = scored[:DB_MAX_RESULTS]   # ← hard cap: max 5 results total
+ 
+    strong  = [s for s in scored if s["score"] >= DB_STRONG_THRESHOLD]
+    partial = [s for s in scored if s["score"] < DB_STRONG_THRESHOLD]
+ 
+    return {"strong": strong, "partial": partial}
  
  
 # ─────────────────────────────────────────────────────────────
@@ -508,145 +547,122 @@ class RunAIScreenStreamView(APIView):
                     yield _sse("query_done", {"index": idx + 1})
                     continue
  
-                # ── Step 1: DB search ─────────────────────────────────────────
-                db_answer = None
+                # ── Step 1: DB search (tiered, multi-match) ───────────────────
+                db_results = {"strong": [], "partial": []}
                 try:
-                    db_answer = find_similar_db_answer(query_embedding)
+                    db_results = search_db_records(query_embedding)
                 except Exception as e:
                     print(f"DB search error: {e}")
  
-                if db_answer:
-                    yield _sse("query_source", {"source": "Database"})
-                    yield _sse("query_chunk",  {"text": db_answer})
-                    yield _sse("query_done",   {"index": idx + 1})
-                    ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
-                    continue
+                all_db_matches = db_results["strong"] + db_results["partial"]
+                # strong matches first (already sorted by score), then partial
+                # Deduplicate by question text in case of overlap
+                seen_questions = set()
+                deduped_matches = []
+                for m in all_db_matches:
+                    if m["question"] not in seen_questions:
+                        seen_questions.add(m["question"])
+                        deduped_matches.append(m)
  
-                # ── Step 2: Document search — ONLY if files were in this request
+                # ── Step 2: Document search — ONLY if files in this request ───
                 top_chunks = []
                 if files_uploaded_this_request:
                     try:
                         top_chunks = get_relevant_chunks(query_embedding, job_id=job_id)
                     except Exception as e:
                         print(f"Chunk search error: {e}")
-                # If no files attached → top_chunks stays [] → source = NOTES or LLM_FALLBACK
  
-                has_doc_context = len(top_chunks) > 0
-                context_text = "\n\n".join(
+                doc_context_text = "\n\n".join(
                     f"{i+1}. {chunk}" for i, chunk in enumerate(top_chunks)
-                ) if has_doc_context else ""
+                ) if top_chunks else ""
  
-                # ── Source attribution — two-step approach ────────────────────
-                #
-                # FIX: The old code labelled source BEFORE the LLM ran, based
-                # only on what context was non-empty. This caused "NOTES" to
-                # appear even when notes were just tone/format guidance and the
-                # LLM actually answered from industry knowledge.
-                #
-                # New approach:
-                #   Step A — non-streaming call: ask LLM to declare which source
-                #            it will use (DOCUMENT / NOTES / LLM_FALLBACK).
-                #            Notes role is explicitly defined as guidance only.
-                #   Step B — emit query_source with the declared value.
-                #   Step C — streaming call: generate the actual answer.
-                #
-                # Notes are passed to BOTH calls so the LLM can use them for
-                # tone/format/length guidance, but they are not counted as a
-                # substantive source unless they actually contain the answer.
+                # ══════════════════════════════════════════════════════════════
+                # RESPONSE STRUCTURE — always two parts:
+                #   Part 1: All DB matches (if any), each as a structured event
+                #   Part 2: AI Generated answer (always, unconditionally)
+                # ══════════════════════════════════════════════════════════════
  
-                source_prompt = f"""You are a professional audit assistant.
+                # ── Part 1: Emit each DB match as its own structured event ────
+                # Frontend receives a separate "db_match" event per record,
+                # each containing s_no, question, answer, source label.
+                # No LLM involved — raw DB data, fully traceable.
+                if deduped_matches:
+                    yield _sse("db_matches_start", {
+                        "total": len(deduped_matches),
+                        "query_index": idx + 1,
+                    })
+                    for match in deduped_matches:
+                        yield _sse("db_match", {
+                            "s_no":     match["serial_no"],
+                            "question": match["question"],
+                            "answer":   match["response"],
+                            "score":    round(match["score"], 4),
+                            "source":   "Database",
+                        })
+                    yield _sse("db_matches_end", {"query_index": idx + 1})
  
-You have been given a QUESTION and optionally a DOCUMENT CONTEXT and NOTES.
+                # ── Part 2: AI Generated answer — always produced ─────────────
+                # Uses DB matches + document + notes as context.
+                # Labelled "AI Generated" regardless of what sources exist.
+                yield _sse("ai_answer_start", {"query_index": idx + 1})
  
-NOTES are guidance only — they may specify tone, format, length, or background context.
-They are NOT the primary source of an answer unless they explicitly contain the answer.
- 
-Your task right now is ONLY to decide which source the answer will primarily come from.
- 
-Reply with exactly one of these three words and nothing else:
-  DOCUMENT       — if DOCUMENT CONTEXT contains relevant information to answer the question
-  NOTES          — if NOTES explicitly contain the answer (not just formatting guidance)
-  LLM_FALLBACK   — if neither document nor notes contain the answer
- 
-QUESTION:
-{query}
- 
-NOTES:
-{note_context or "(none provided)"}
- 
-DOCUMENT CONTEXT:
-{context_text or "(no document uploaded for this request)"}
- 
-Reply with one word only: DOCUMENT, NOTES, or LLM_FALLBACK"""
- 
-                # Step A: classify source (non-streaming, fast)
-                source = "LLM_FALLBACK"  # safe default
-                try:
-                    src_response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": source_prompt}],
-                        temperature=0.0,
-                        max_tokens=5,
+                # Build context block for the AI prompt from DB matches
+                db_context_for_prompt = ""
+                if deduped_matches:
+                    db_context_for_prompt = "\n\n".join(
+                        f"S.No {m['serial_no']} | Score: {m['score']:.2f}\n"
+                        f"Q: {m['question']}\n"
+                        f"A: {m['response']}"
+                        for m in deduped_matches[:10]   # cap at 10 for prompt size
                     )
-                    raw = src_response.choices[0].message.content.strip().upper()
-                    if "DOCUMENT" in raw:
-                        source = "Document"
-                    elif "NOTES" in raw:
-                        source = "Notes"
-                    else:
-                        source = "AI Generated"
-                except Exception as e:
-                    print(f"Source classification error: {e}")
-                    # Fall back to heuristic if classification call fails
-                    if has_doc_context:
-                        source = "Document"
-                    elif note_context:
-                        source = "Notes"
-                    else:
-                        source = "AI Generated"
  
-                # Step B: emit source before streaming answer
-                yield _sse("query_source", {"source": source})
+                ai_prompt = f"""You are a senior audit professional with Big Four standards (Deloitte, PwC, EY, KPMG).
  
-                # Step C: stream the actual answer
-                answer_prompt = f"""You are a professional audit assistant. Follow this STRICT priority order:
+Your task is to write a single, well-structured paragraph that provides an audit-defensible answer to the question below.
  
-1. DOCUMENT CONTEXT — if provided and relevant, base your answer primarily on this.
-2. NOTES — use notes for tone, format, and length guidance. Use them as a substantive
-   source only if they explicitly contain information that answers the question.
-3. INDUSTRY STANDARD — if neither document nor notes contain the answer, provide a
-   professional, industry-standard audit answer. Start with:
-   "Based on industry-standard audit practices:"
+STRICT REQUIREMENTS:
+- Write exactly ONE well-structured paragraph. No bullet points. No numbered lists. No sub-headings.
+- The answer must be fact-based, clear, and logically structured.
+- It must provide traceability and logical justification for any conclusions.
+- It must align with risk mitigation and professional audit requirements.
+- It must be suitable for professional audit review at Big Four standards.
+- Do NOT hallucinate. If a fact is uncertain, qualify it explicitly.
+- If relevant database entries or document context are provided below, incorporate
+  the most pertinent information into your answer naturally within the paragraph.
+- If no relevant context exists, answer from industry-standard audit knowledge.
  
 QUESTION:
 {query}
  
-NOTES:
+DATABASE ENTRIES (for reference — incorporate relevant facts if applicable):
+{db_context_for_prompt or "(none)"}
+ 
+DOCUMENT CONTEXT (for reference — use if relevant):
+{doc_context_text or "(no document uploaded)"}
+ 
+NOTES (tone/format guidance and supplementary context):
 {note_context or "(none provided)"}
  
-DOCUMENT CONTEXT:
-{context_text or "(no document uploaded for this request)"}
- 
-INSTRUCTIONS:
-- Be precise, professional, and thorough.
-- Do NOT hallucinate. If unsure, say so explicitly.
-- If using document context, cite the relevant section.
-- If falling back to industry standards, clearly state it at the start.
-"""
+Write one audit-defensible paragraph now:"""
  
                 try:
-                    response = client.chat.completions.create(
+                    ai_response = client.chat.completions.create(
                         model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": answer_prompt}],
+                        messages=[{"role": "user", "content": ai_prompt}],
                         temperature=0.3,
                         stream=True,
                     )
-                    for chunk in response:
+                    for chunk in ai_response:
                         delta = chunk.choices[0].delta.content
                         if delta:
-                            yield _sse("query_chunk", {"text": delta})
+                            yield _sse("ai_answer_chunk", {"text": delta})
                 except Exception as e:
-                    yield _sse("error", {"message": f"LLM error for query {idx+1}: {str(e)}"})
+                    yield _sse("error", {"message": f"AI generation error for query {idx+1}: {str(e)}"})
+ 
+                yield _sse("ai_answer_end", {
+                    "query_index": idx + 1,
+                    "source": "AI Generated",
+                })
  
                 yield _sse("query_done", {"index": idx + 1})
                 ProcessingJob.objects.filter(job_id=job_id).update(processed_queries=idx + 1)
