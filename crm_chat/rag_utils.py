@@ -16,6 +16,7 @@ import json
 import hashlib
 import fitz
 import pytesseract
+from PIL import Image
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 logger = logging.getLogger(__name__)
