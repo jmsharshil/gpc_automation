@@ -14,11 +14,7 @@ from typing import List, Tuple, Dict, Optional
 import PyPDF2
 import json
 import hashlib
-import fitz
-import pytesseract
-from PIL import Image
 
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -26,81 +22,28 @@ CHUNK_SIZE = 1000  # tokens per chunk (approximate)
 CHUNK_OVERLAP = 200  # overlap between chunks
 EMBEDDING_DIMENSION = 1536  # for OpenAI text-embedding-3-small
 
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> Dict[int, str]:
     """
     Extract text from PDF bytes.
-    - Text-based pages → fast PyMuPDF extraction
-    - Image-based pages → OCR fallback via pytesseract
-    Works with: text-only, image-only, and mixed PDFs.
     Returns: {page_number: text}
     """
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         pages_text = {}
- 
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            text = page.get_text().strip()
- 
-            if len(text) < 50:  # image-based page → OCR
-                logger.info(
-                    "Page %s is image-based (%s chars), applying OCR",
-                    page_num + 1,
-                    len(text)
-                )
-                try:
-                    mat = fitz.Matrix(200 / 72, 200 / 72)  # 200 DPI
-                    pix = page.get_pixmap(matrix=mat)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    text = pytesseract.image_to_string(img, lang="eng")
-                    logger.info(
-                        "OCR extracted %s chars from page %s",
-                        len(text),
-                        page_num + 1
-                    )
-                except Exception as ocr_err:
-                    logger.warning(
-                        "OCR failed for page %s: %s",
-                        page_num + 1,
-                        ocr_err
-                    )
-                    text = ""
- 
-            pages_text[page_num + 1] = text
- 
-        logger.info(
-            "Extraction complete: total_pages=%s text_pages=%s ocr_pages=%s",
-            len(doc),
-            sum(1 for t in pages_text.values() if len(t) >= 50),
-            sum(1 for t in pages_text.values() if len(t) < 50),
-        )
+        
+        for page_num, page in enumerate(reader.pages, 1):
+            try:
+                text = page.extract_text() or ""
+                pages_text[page_num] = text
+            except Exception as e:
+                logger.warning(f"Failed to extract page {page_num}: {e}")
+                pages_text[page_num] = ""
+        
         return pages_text
- 
     except Exception as e:
-        logger.error("PDF extraction failed: %s", e)
+        logger.error(f"PDF extraction failed: {e}")
         raise
-
-# def extract_text_from_pdf(pdf_bytes: bytes) -> Dict[int, str]:
-#     """
-#     Extract text from PDF bytes.
-#     Returns: {page_number: text}
-#     """
-#     try:
-#         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-#         pages_text = {}
-        
-#         for page_num, page in enumerate(reader.pages, 1):
-#             try:
-#                 text = page.extract_text() or ""
-#                 pages_text[page_num] = text
-#             except Exception as e:
-#                 logger.warning(f"Failed to extract page {page_num}: {e}")
-#                 pages_text[page_num] = ""
-        
-#         return pages_text
-#     except Exception as e:
-#         logger.error(f"PDF extraction failed: {e}")
-#         raise
 
 
 def split_into_chunks(pages_text: Dict[int, str]) -> List[Dict]:
