@@ -958,7 +958,7 @@ class MessageListAPIView(generics.ListAPIView):
 
 # ====================== SEND MESSAGE WITH RAG SUPPORT ======================
 class SendMessageAPIView(APIView):
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
  
     def post(self, request, chat_pk):
@@ -1212,7 +1212,7 @@ class StreamingChatAPIView(APIView):
     POST /api/v1/chats/<chat_pk>/messages/stream/
     The complete assistant message is saved to the DB once the stream finishes.
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
  
     def post(self, request, chat_pk):
