@@ -388,30 +388,37 @@ def page_to_png_bytes(pdf_bytes: bytes, page_number: int) -> bytes:
 #     return buf.getvalue()
  
  
-import cv2
- 
 def sanitize_image_for_ocr(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     arr = np.array(img)
-   
+
     # Detect black and blue pixels
     black_mask = (arr[:, :, 0] < 30) & (arr[:, :, 1] < 30) & (arr[:, :, 2] < 30)
     blue_mask  = (arr[:, :, 2] > 150) & (arr[:, :, 0] < 80) & (arr[:, :, 1] < 80)
-    combined_mask = (black_mask | blue_mask).astype(np.uint8) * 255
- 
-    # Find connected regions using OpenCV
-    num_features, labeled, stats, _ = cv2.connectedComponentsWithStats(
-        combined_mask, connectivity=8
-    )
-   
-    # Only replace LARGE regions (redaction boxes)
-    MIN_REDACTION_PIXELS = 500
- 
-    for region_id in range(1, num_features):  # 0 is background
-        region_size = stats[region_id, cv2.CC_STAT_AREA]
-        if region_size > MIN_REDACTION_PIXELS:
-            arr[labeled == region_id] = [255, 255, 255]  # white
-   
+    combined_mask = (black_mask | blue_mask)
+
+    try:
+        import cv2
+
+        combined_mask_uint8 = combined_mask.astype(np.uint8) * 255
+
+        num_features, labeled, stats, _ = cv2.connectedComponentsWithStats(
+            combined_mask_uint8, connectivity=8
+        )
+
+        MIN_REDACTION_PIXELS = 500
+
+        for region_id in range(1, num_features):
+            region_size = stats[region_id, cv2.CC_STAT_AREA]
+            if region_size > MIN_REDACTION_PIXELS:
+                arr[labeled == region_id] = [255, 255, 255]
+
+    except Exception as e:
+        logger.warning("cv2 not available, using fallback: %s", e)
+
+        # 🔁 Fallback: simple masking (no connected components)
+        arr[combined_mask] = [255, 255, 255]
+
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="PNG")
     return buf.getvalue()
