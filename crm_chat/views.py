@@ -609,8 +609,7 @@ from .models import Chat, Message, UserOpenAISetting, DocumentChunk, DocumentPro
 from .serializers import ChatSerializer, MessageSerializer, UserOpenAISettingSerializer, ChatNameSerializer
 from .permissions import IsOwner
 from .rag_utils import (
-    extract_text_from_pdf, split_into_chunks, get_embeddings,
-    semantic_search, build_context_from_chunks, truncate_text
+    extract_text_from_uploaded_file_async, split_into_chunks
 )
 import openai
 from django.utils.text import Truncator
@@ -632,6 +631,7 @@ from openai import OpenAI
 import sys
 from django.http import StreamingHttpResponse
 import time
+import concurrent.futures
 
 
 logging.basicConfig(
@@ -665,12 +665,25 @@ def resolve_request_user(request, chat=None):
 CHARACTER_LIMIT = 100_000
 openai.api_key = getattr(settings, 'OPENAI_API_KEY', None)
 
-
+def _run_pdf_processing(chat, file_bytes: bytes, attachment_name: str) -> int:
+    """
+    Runs async PDF processing in an isolated thread with its own event loop.
+    Safe to call from any sync Django view regardless of IocpProactor state (Windows).
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(
+            process_pdf_for_rag(chat, file_bytes, attachment_name)
+        )
+    finally:
+        loop.close()
+        
 # ====================== HELPER: PDF PROCESSING FOR RAG ======================
 
-async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
+async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> int:
     """
-    Process large PDF and create embeddings for RAG.
+    Process PDF/image and create embeddings for RAG.
     Returns: Number of chunks created
     """
     doc_processing = None
@@ -678,11 +691,12 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
         logger.info(
             "Starting PDF processing for chat_id=%s pdf_bytes=%s",
             chat.id,
-            len(pdf_bytes) if pdf_bytes is not None else 0,
+            len(file_bytes) if file_bytes is not None else 0,
         )
-
-        # Extract text from PDF
-        pages_text = extract_text_from_pdf(pdf_bytes)
+ 
+        # Extract text — async parallel OCR for image-based pages
+        pages_text = await extract_text_from_uploaded_file_async(file_name, file_bytes)
+ 
         page_text_lengths = [len(text or "") for text in pages_text.values()]
         logger.info(
             "Extracted PDF text for chat_id=%s pages=%s non_empty_pages=%s total_chars=%s",
@@ -691,7 +705,7 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
             sum(1 for length in page_text_lengths if length > 0),
             sum(page_text_lengths),
         )
-        
+ 
         # Create chunks
         logger.info(
             "Creating chunks for chat_id=%s chunk_size=%s overlap=%s",
@@ -718,7 +732,7 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
             )
         else:
             logger.warning("No chunks were created for chat_id=%s", chat.id)
-        
+ 
         # Update document processing status
         doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
             chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
@@ -731,13 +745,13 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
         )
         doc_processing.total_pages = len(pages_text)
         await sync_to_async(doc_processing.save)()
-        
+ 
         # Get embeddings (batch by 50 to manage API rate limits)
         client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-        
+ 
         chunk_batch_size = 50
         all_embedding_vectors = []
-        
+ 
         for batch_idx in range(0, len(chunks), chunk_batch_size):
             batch_chunks = chunks[batch_idx:batch_idx + chunk_batch_size]
             batch_texts = [chunk['text'] for chunk in batch_chunks]
@@ -749,17 +763,17 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
                 batch_chunks[0]['chunk_index'] if batch_chunks else None,
                 batch_chunks[-1]['chunk_index'] if batch_chunks else None,
             )
-            
+ 
             try:
                 response = client.embeddings.create(
                     model="text-embedding-3-small",
                     input=batch_texts,
                     encoding_format="float"
                 )
-                
+ 
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embedding_vectors.extend(batch_embeddings)
-                
+ 
                 logger.info(
                     "Embedded chunk batch for chat_id=%s batch_number=%s embedded_count=%s total_embeddings=%s",
                     chat.id,
@@ -775,43 +789,41 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
                     len(batch_chunks),
                 )
                 raise
-        
+ 
         # Save chunks to database
         chunk_objects = []
         for chunk, embedding_vector in zip(chunks, all_embedding_vectors):
-            # Serialize embedding as JSON string for storage
             embedding_json = json.dumps(embedding_vector)
-            
             chunk_obj = DocumentChunk(
                 chat=chat,
                 page_number=chunk['page_number'],
                 chunk_index=chunk['chunk_index'],
                 text=chunk['text'],
-                embedding=embedding_json.encode('utf-8'),  # Store as bytes
+                embedding=embedding_json.encode('utf-8'),
                 char_count=chunk['char_count'],
                 embedding_model='text-embedding-3-small'
             )
             chunk_objects.append(chunk_obj)
-        
-        # Bulk create in database
+ 
         logger.info(
             "Saving chunk objects for chat_id=%s chunk_object_count=%s",
             chat.id,
             len(chunk_objects),
         )
+        await sync_to_async(DocumentChunk.objects.filter(chat=chat).delete)()
         await sync_to_async(DocumentChunk.objects.bulk_create)(chunk_objects, batch_size=100)
         logger.info(
             "Saved document chunks for chat_id=%s saved_count=%s",
             chat.id,
             len(chunk_objects),
         )
-        
+ 
         # Update processing status
         doc_processing.status = 'completed'
         doc_processing.total_chunks = len(chunks)
         doc_processing.completed_at = timezone.now()
         await sync_to_async(doc_processing.save)()
-        
+ 
         # Update chat
         chat.has_document = True
         await sync_to_async(chat.save)()
@@ -821,9 +833,9 @@ async def process_pdf_for_rag(chat: Chat, pdf_bytes: bytes) -> int:
             len(pages_text),
             len(chunks),
         )
-        
+ 
         return len(chunks)
-    
+ 
     except Exception as e:
         logger.exception("PDF processing failed for chat_id=%s: %s", chat.id, e)
         if doc_processing is not None:
@@ -946,111 +958,96 @@ class MessageListAPIView(generics.ListAPIView):
 
 # ====================== SEND MESSAGE WITH RAG SUPPORT ======================
 class SendMessageAPIView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-
+ 
     def post(self, request, chat_pk):
         chat = get_object_or_404(Chat, pk=chat_pk)
         user = resolve_request_user(request, chat=chat)
-
+ 
         user_text = request.data.get('content', '').strip()
         attachment = request.FILES.get('attachment')
         attachment_name = getattr(attachment, 'name', '') if attachment else ''
         attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
-
+ 
+        allowed_ext = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
+ 
         logger.info(
-            "SendMessageAPIView received request chat_id=%s user_id=%s has_attachment=%s attachment_name=%s attachment_content_type=%s user_text_length=%s has_document=%s",
-            chat.id,
-            user.id,
-            bool(attachment),
-            attachment_name,
-            attachment_content_type,
-            len(user_text),
-            chat.has_document,
+            "SendMessageAPIView received request chat_id=%s user_id=%s has_attachment=%s "
+            "attachment_name=%s attachment_content_type=%s user_text_length=%s has_document=%s",
+            chat.id, user.id, bool(attachment), attachment_name,
+            attachment_content_type, len(user_text), chat.has_document,
         )
-
+ 
         if not user_text and not attachment:
             return Response(
                 {'error': 'content or attachment is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-        # --- Handle PDF upload for RAG ---
-        if attachment and chat.has_document == False:
+ 
+        # --- Handle file upload for RAG ---
+        if attachment_name.lower().endswith(allowed_ext):
+            file_bytes = attachment.read()
             logger.info(
-                "PDF upload detected for chat_id=%s attachment_name=%s attachment_content_type=%s",
-                chat.id,
-                attachment_name,
-                attachment_content_type,
+                "Read uploaded file bytes for chat_id=%s attachment_name=%s byte_count=%s",
+                chat.id, attachment_name, len(file_bytes),
             )
-
-            if attachment_name.lower().endswith('.pdf') or attachment_content_type == 'application/pdf':
-                file_bytes = attachment.read()
-                logger.info(
-                    "Read uploaded PDF bytes for chat_id=%s attachment_name=%s byte_count=%s",
-                    chat.id,
-                    attachment_name,
-                    len(file_bytes),
-                )
-                
-                # Save user message about document upload
-                user_msg = Message.objects.create(
-                    chat=chat,
-                    role='user',
-                    content=user_text if user_text else f"[Uploaded PDF: {attachment_name}]",
-                    attachment=attachment,
-                    attachment_name=attachment_name,
-                    attachment_content_type=attachment_content_type,
-                )
-                logger.info(
-                    "Created user message for chat_id=%s message_id=%s content=%s",
-                    chat.id,
-                    user_msg.id,
-                    user_msg.content[:80],
-                )
-                
-                # Process PDF asynchronously
-                try:
-                    # Run async function synchronously
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    logger.info("Starting synchronous PDF processing loop for chat_id=%s", chat.id)
-                    num_chunks = loop.run_until_complete(
-                        process_pdf_for_rag(chat, file_bytes)
+ 
+            # Save user message
+            user_msg = Message.objects.create(
+                chat=chat,
+                role='user',
+                content=user_text if user_text else f"[Uploaded file: {attachment_name}]",
+                attachment=attachment,
+                attachment_name=attachment_name,
+                attachment_content_type=attachment_content_type,
+            )
+            logger.info(
+                "Created user message for chat_id=%s message_id=%s content=%s",
+                chat.id, user_msg.id, user_msg.content[:80],
+            )
+ 
+            # Process file in isolated thread (fixes Windows IocpProactor conflict)
+            try:
+                logger.info("Starting PDF processing for chat_id=%s", chat.id)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        _run_pdf_processing, chat, file_bytes, attachment_name
                     )
-                    logger.info(
-                        "PDF processing loop completed for chat_id=%s chunk_count=%s",
-                        chat.id,
-                        num_chunks,
-                    )
-
-                    # If user also sent a prompt with the upload, answer it now
-                    if not user_text:
-                        # No prompt — just confirm processing silently
-                        completion_msg = Message.objects.create(
-                            chat=chat,
-                            role='assistant',
-                            content=f"✅ PDF \"{attachment_name}\" processed ({num_chunks} chunks). You can now ask questions about it."
-                        )
-                        serializer = MessageSerializer(completion_msg, context={'request': request})
-                        return Response(serializer.data, status=status.HTTP_201_CREATED)
-                    
-                except Exception as e:
-                    logger.exception("PDF upload processing failed for chat_id=%s attachment_name=%s: %s", chat.id, attachment_name, e)
-                    error_msg = Message.objects.create(
+                    num_chunks = future.result()
+ 
+                logger.info(
+                    "PDF processing completed for chat_id=%s chunk_count=%s",
+                    chat.id, num_chunks,
+                )
+ 
+                if not user_text:
+                    completion_msg = Message.objects.create(
                         chat=chat,
                         role='assistant',
-                        content=f"❌ Failed to process PDF: {str(e)}"
+                        content=f'✅ File "{attachment_name}" processed ({num_chunks} chunks). You can now ask questions about it.',
                     )
-                    serializer = MessageSerializer(error_msg, context={'request': request})
-                    return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
-
+                    serializer = MessageSerializer(completion_msg, context={'request': request})
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
+ 
+            except Exception as e:
+                logger.exception(
+                    "File upload processing failed for chat_id=%s attachment_name=%s: %s",
+                    chat.id, attachment_name, e,
+                )
+                error_msg = Message.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=f"❌ Failed to process file: {str(e)}",
+                )
+                serializer = MessageSerializer(error_msg, context={'request': request})
+                return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
+ 
         # --- Handle regular chat / document Q&A ---
-        # Save user message
         existing_user_msg = Message.objects.filter(
             chat=chat, role='user'
         ).order_by('-created_at').first()
-        
+ 
         if existing_user_msg and existing_user_msg.content == user_text:
             user_msg = existing_user_msg
         else:
@@ -1062,68 +1059,59 @@ class SendMessageAPIView(APIView):
                 attachment_name=getattr(attachment, 'name', ''),
                 attachment_content_type=getattr(attachment, 'content_type', ''),
             )
-
+ 
         # Build prompt for OpenAI
         system_prompt = chat.system_prompt or ""
         messages_payload = []
-        
+ 
         if system_prompt:
             messages_payload.append({'role': 'system', 'content': system_prompt})
-
-        # Get RAG context if document exists
-        rag_context = ""
+ 
+        # RAG context
         if chat.has_document:
             try:
                 client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-                
-                # Get embedding for user query
+ 
                 response = client.embeddings.create(
                     model="text-embedding-3-small",
                     input=[user_text],
                     encoding_format="float"
                 )
                 query_embedding = response.data[0].embedding
-                
-                # Find relevant chunks
+ 
                 user_setting = getattr(user, 'openai_setting', None)
                 max_chunks = getattr(user_setting, 'max_context_chunks', 5)
                 relevant_chunks = get_relevant_chunks_for_query(chat, query_embedding, max_chunks)
-                
-                # Build context from chunks
+ 
                 if relevant_chunks:
                     context_parts = []
                     for chunk in relevant_chunks:
-                        page_ref = f"[Page {chunk.page_number}]"
-                        context_parts.append(f"{page_ref}\n{chunk.text}")
-                    
-                    rag_context = "\n\n" + "="*50 + "\n\n".join(context_parts)
-                    
-                    # Add system instruction for RAG
+                        context_parts.append(f"[Page {chunk.page_number}]\n{chunk.text}")
+ 
+                    rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
+ 
                     if messages_payload and messages_payload[0]['role'] == 'system':
-                        messages_payload[0]['content'] += f"\n\n🔗 You are answering based on the following document excerpts:\n{rag_context}"
+                        messages_payload[0]['content'] += (
+                            f"\n\n🔗 You are answering based on the following document excerpts:\n{rag_context}"
+                        )
                     else:
                         messages_payload.insert(0, {
                             'role': 'system',
-                            'content': f"Answer ONLY based on the following document:\n{rag_context}"
+                            'content': f"Answer ONLY based on the following document:\n{rag_context}",
                         })
-            
+ 
             except Exception as e:
-                logger.error(f"RAG retrieval failed: {e}")
-                # Continue without RAG if it fails
-                pass
-
-        # Add conversation history
-        # recent_messages = chat.messages.all().order_by('-created_at')[:20][::-1]
-        recent_messages = chat.messages.all().order_by('-created_at')[:5][::-1]  # was 20
-
+                logger.error("RAG retrieval failed: %s", e)
+ 
+        # Conversation history
+        recent_messages = chat.messages.all().order_by('-created_at')[:10][::-1]
         for m in recent_messages:
-            if m.pk != user_msg.pk:  # Skip the message we just created
+            if m.pk != user_msg.pk:
                 messages_payload.append({'role': m.role, 'content': m.content or ''})
-
-        # Add current user message
+ 
         messages_payload.append({'role': 'user', 'content': user_text})
-
-        # Get model and params
+ 
+        # Model params
         user_setting = getattr(user, 'openai_setting', None)
         model = (
             request.data.get('model') or
@@ -1132,40 +1120,40 @@ class SendMessageAPIView(APIView):
         )
         max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 2000))
         temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
-
-        logger.debug(f"Sending to OpenAI → model={model} temp={temperature} max_tokens={max_tokens}")
-
+ 
+        logger.debug("Sending to OpenAI → model=%s temp=%s max_tokens=%s", model, temperature, max_tokens)
+ 
         try:
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-
+ 
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages_payload,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-
+ 
             assistant_text = resp.choices[0].message.content or ""
             usage = {
                 'input_tokens': resp.usage.prompt_tokens,
                 'output_tokens': resp.usage.completion_tokens,
                 'total_tokens': resp.usage.total_tokens,
             }
-            
-            logger.info(f"OpenAI response: {usage}")
-
+ 
+            logger.info("OpenAI response: %s", usage)
+ 
             assistant_msg = Message.objects.create(
                 chat=chat,
                 role='assistant',
                 content=assistant_text,
-                metadata={'openai_usage': usage}
+                metadata={'openai_usage': usage},
             )
-
+ 
             serializer = MessageSerializer(assistant_msg, context={'request': request})
             return Response(serializer.data, status=status.HTTP_201_CREATED)
-
+ 
         except Exception as e:
-            logger.exception(f"OpenAI call failed: {e}")
+            logger.exception("OpenAI call failed: %s", e)
             return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
 
@@ -1222,67 +1210,72 @@ class DocumentProcessingStatusAPIView(APIView):
 class StreamingChatAPIView(APIView):
     """
     POST /api/v1/chats/<chat_pk>/messages/stream/
-
     The complete assistant message is saved to the DB once the stream finishes.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-
+ 
     def post(self, request, chat_pk):
         chat = get_object_or_404(Chat, pk=chat_pk)
         user = resolve_request_user(request, chat=chat)
-
+ 
         user_text = request.data.get('content', '').strip()
         attachment = request.FILES.get('attachment')
-
+ 
         if not user_text and not attachment:
             return Response(
                 {'error': 'content or attachment is required'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        # --- Handle PDF upload (non-streaming path, same as SendMessageAPIView) ---
+ 
         attachment_name = getattr(attachment, 'name', '') if attachment else ''
         attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
-
-        if attachment and not chat.has_document:
-            if attachment_name.lower().endswith('.pdf') or attachment_content_type == 'application/pdf':
-                file_bytes = attachment.read()
-                user_msg = Message.objects.create(
-                    chat=chat,
-                    role='user',
-                    content=user_text if user_text else f"[Uploaded PDF: {attachment_name}]",
-                    attachment=attachment,
-                    attachment_name=attachment_name,
-                    attachment_content_type=attachment_content_type,
-                )
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    num_chunks = loop.run_until_complete(process_pdf_for_rag(chat, file_bytes))
-
-                    if not user_text:
-                        completion_msg = Message.objects.create(
-                            chat=chat,
-                            role='assistant',
-                            content=f'✅ PDF "{attachment_name}" processed ({num_chunks} chunks). You can now ask questions about it.',
-                        )
-                        serializer = MessageSerializer(completion_msg, context={'request': request})
-                        return Response(serializer.data, status=status.HTTP_201_CREATED)
-                except Exception as e:
-                    logger.exception("PDF upload processing failed for streaming view: %s", e)
-                    error_msg = Message.objects.create(
-                        chat=chat, role='assistant',
-                        content=f"❌ Failed to process PDF: {str(e)}",
+        allowed_ext = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
+ 
+        # --- Handle file upload for RAG (non-streaming path) ---
+        if attachment_name.lower().endswith(allowed_ext):
+            file_bytes = attachment.read()
+            user_msg = Message.objects.create(
+                chat=chat,
+                role='user',
+                content=user_text if user_text else f"[Uploaded file: {attachment_name}]",
+                attachment=attachment,
+                attachment_name=attachment_name,
+                attachment_content_type=attachment_content_type,
+            )
+ 
+            try:
+                # Process in isolated thread (fixes Windows IocpProactor conflict)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        _run_pdf_processing, chat, file_bytes, attachment_name
                     )
-                    serializer = MessageSerializer(error_msg, context={'request': request})
-                    return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
-
+                    num_chunks = future.result()
+ 
+                if not user_text:
+                    completion_msg = Message.objects.create(
+                        chat=chat,
+                        role='assistant',
+                        content=f'✅ File "{attachment_name}" processed ({num_chunks} chunks). You can now ask questions about it.',
+                    )
+                    serializer = MessageSerializer(completion_msg, context={'request': request})
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
+ 
+            except Exception as e:
+                logger.exception("File upload processing failed for streaming view: %s", e)
+                error_msg = Message.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=f"❌ Failed to process file: {str(e)}",
+                )
+                serializer = MessageSerializer(error_msg, context={'request': request})
+                return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
+ 
         # --- Save user message ---
         existing_user_msg = Message.objects.filter(
             chat=chat, role='user'
         ).order_by('-created_at').first()
-
+ 
         if existing_user_msg and existing_user_msg.content == user_text:
             user_msg = existing_user_msg
         else:
@@ -1294,14 +1287,14 @@ class StreamingChatAPIView(APIView):
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
             )
-
-        # --- Build messages_payload (same as SendMessageAPIView, including RAG) ---
+ 
+        # --- Build messages_payload with RAG ---
         system_prompt = chat.system_prompt or ""
         messages_payload = []
-
+ 
         if system_prompt:
             messages_payload.append({'role': 'system', 'content': system_prompt})
-
+ 
         # RAG context
         if chat.has_document:
             try:
@@ -1315,7 +1308,7 @@ class StreamingChatAPIView(APIView):
                 user_setting = getattr(user, 'openai_setting', None)
                 max_chunks = getattr(user_setting, 'max_context_chunks', 5)
                 relevant_chunks = get_relevant_chunks_for_query(chat, query_embedding, max_chunks)
-
+ 
                 if relevant_chunks:
                     context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in relevant_chunks]
                     rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
@@ -1328,15 +1321,15 @@ class StreamingChatAPIView(APIView):
                         })
             except Exception as e:
                 logger.error("RAG retrieval failed in streaming view: %s", e)
-
-        # Recent history
-        recent_messages = chat.messages.all().order_by('-created_at')[:5][::-1]
+ 
+        # Conversation history
+        recent_messages = chat.messages.all().order_by('-created_at')[:10][::-1]
         for m in recent_messages:
             if m.pk != user_msg.pk:
                 messages_payload.append({'role': m.role, 'content': m.content or ''})
-
+ 
         messages_payload.append({'role': 'user', 'content': user_text})
-
+ 
         # Model params
         user_setting = getattr(user, 'openai_setting', None)
         model = (
@@ -1346,14 +1339,17 @@ class StreamingChatAPIView(APIView):
         )
         max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 2000))
         temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
-
-        logger.debug("Streaming to OpenAI → model=%s temp=%s max_tokens=%s", model, temperature, max_tokens)
-
-        # --- Generator that yields SSE chunks ---
+ 
+        logger.debug(
+            "Streaming to OpenAI → model=%s temp=%s max_tokens=%s",
+            model, temperature, max_tokens,
+        )
+ 
+        # --- SSE generator ---
         def event_stream():
             full_text = []
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-
+ 
             try:
                 with client.chat.completions.create(
                     model=model,
@@ -1367,11 +1363,9 @@ class StreamingChatAPIView(APIView):
                         if delta and delta.content:
                             text_piece = delta.content
                             full_text.append(text_piece)
-                            # SSE format: "data: <content>\n\n"
-                            # Escape newlines so each SSE message stays on one logical line
                             escaped = text_piece.replace('\n', '\\n')
                             yield f"data: {escaped}\n\n"
-
+ 
                 # Stream finished — save to DB
                 assistant_text = "".join(full_text)
                 Message.objects.create(
@@ -1380,21 +1374,26 @@ class StreamingChatAPIView(APIView):
                     content=assistant_text,
                     metadata={'streaming': True},
                 )
-                logger.info("Streaming complete for chat_id=%s chars=%s", chat.id, len(assistant_text))
-
+                logger.info(
+                    "Streaming complete for chat_id=%s chars=%s",
+                    chat.id, len(assistant_text),
+                )
+ 
             except Exception as e:
-                logger.exception("Streaming OpenAI call failed for chat_id=%s: %s", chat.id, e)
+                logger.exception(
+                    "Streaming OpenAI call failed for chat_id=%s: %s", chat.id, e
+                )
                 yield f"data: [ERROR] {str(e)}\n\n"
-
+ 
             finally:
                 yield "data: [DONE]\n\n"
-
+ 
         response = StreamingHttpResponse(
             event_stream(),
             content_type='text/event-stream',
         )
         response['Cache-Control'] = 'no-cache'
-        response['X-Accel-Buffering'] = 'no'  # Disable Nginx buffering
+        response['X-Accel-Buffering'] = 'no'
         return response
 class ChatNameListAPIView(generics.ListAPIView):
     serializer_class = ChatNameSerializer
