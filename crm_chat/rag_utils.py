@@ -398,7 +398,7 @@ def sanitize_image_for_ocr(image_bytes: bytes) -> bytes:
     combined_mask = (black_mask | blue_mask)
 
     try:
-        import cv2
+        import cv2 # type: ignore
 
         combined_mask_uint8 = combined_mask.astype(np.uint8) * 255
 

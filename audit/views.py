@@ -152,20 +152,20 @@ class DashboardStatsView(APIView):
 #
 # text-embedding-3-small cosine similarity on domain-specific audit text:
 #
-#   ≥ 0.82  STRONG  — same concept, very close or exact wording match
-#   ≥ 0.70  PARTIAL — same concept, paraphrased / reworded / incomplete
-#   < 0.70  NOISE   — shares audit vocabulary but different topic entirely
-#                     (e.g. "asset volatility" vs "unsystematic risk premium")
+#   ≥ 0.82  STRONG       — same concept, very close or exact wording
+#   ≥ 0.70  PARTIAL      — same concept, paraphrased / reworded
+#   ≥ 0.60  CONCEPT_PASS — same concept, different specific values
+#                          (e.g. "unsystematic risk premium 5%" vs "...10.5%")
+#                          Only used in the concept re-rank pass, not the
+#                          raw query pass, so noise stays filtered out.
+#   < 0.60  NOISE        — different topic entirely
 #
-# The old values (0.75 / 0.40) caused 40-50 noise results because all
-# audit records share domain words (risk, premium, %, assumption, valuation)
-# and easily scored above 0.40 without being topically related.
-#
-DB_STRONG_THRESHOLD  = 0.82   # was 0.75
-DB_PARTIAL_THRESHOLD = 0.70   # was 0.40 — this was the main source of noise
-DB_MAX_RESULTS       = 5      # hard cap: never return more than 5 DB matches
+DB_STRONG_THRESHOLD  = 0.82
+DB_PARTIAL_THRESHOLD = 0.70
+DB_CONCEPT_THRESHOLD = 0.60   # used in concept re-rank pass only
+DB_MAX_RESULTS       = 20     # raised: concept pass may find many valid variants
  
-DOC_SIMILARITY_THRESHOLD = 0.50   # raised from 0.40 for same reason
+DOC_SIMILARITY_THRESHOLD = 0.50
  
  
 # ─────────────────────────────────────────────────────────────
@@ -199,16 +199,7 @@ def get_queries_from_request(data) -> list:
     Rules:
       - Repeated form-data keys (recommended): each key = one complete query.
         Paragraphs inside a single key value are preserved as-is.
-          queries=First question, with a comma\\nand a second line still part of query 1
-          queries=Second question entirely separate
-        → ["First question, with a comma\\nand a second line still part of query 1",
-           "Second question entirely separate"]
- 
-      - Single string fallback (JSON body or single form field):
-        Split ONLY on double-newline (\\n\\n) — paragraph boundary = query boundary.
-        Single newlines within a paragraph are kept intact.
-          "Question one paragraph one\\nstill question one\\n\\nQuestion two starts here"
-        → ["Question one paragraph one\\nstill question one", "Question two starts here"]
+      - Single string fallback: split on double-newline only.
     """
     if hasattr(data, "getlist"):
         values = data.getlist("queries")
@@ -227,72 +218,167 @@ def get_queries_from_request(data) -> list:
     return []
  
  
-# ─────────────────────────────────────────────────────────────
-# DB search — strict thresholds, hard result cap
-# ─────────────────────────────────────────────────────────────
- 
-def search_db_records(query_embedding: list) -> dict:
+def _extract_core_concept(query: str) -> str:
     """
-    Searches ALL AuditRecord rows using pre-stored embeddings.
+    Uses the LLM to extract the core semantic concept from a query.
  
-    Scoring:
-        strong  — score >= DB_STRONG_THRESHOLD (0.82): same concept, close wording
-        partial — score in [DB_PARTIAL_THRESHOLD, DB_STRONG_THRESHOLD)
-                  (0.70–0.82): same concept, paraphrased/incomplete
+    This replaces the old regex-based approach which only worked for
+    numeric variations (e.g. "5%" vs "10%") and failed on all other
+    query types.
  
-    Hard cap: at most DB_MAX_RESULTS (5) total across both tiers, best-first.
-    Records below DB_PARTIAL_THRESHOLD (0.70) are discarded as noise.
+    The LLM understands what the question is actually asking about and
+    produces a concept phrase that captures meaning independent of:
+      - specific numeric values
+      - question phrasing / sentence structure
+      - filler words and hedging language
  
-    Returns {"strong": [...], "partial": [...]} sorted best-score-first.
+    Examples:
+      "Why have you selected an unsystematic risk premium of 5%?"
+      → "unsystematic risk premium selection rationale justification"
+ 
+      "Please provide your reasoning for excluding Ideal Power in the
+       Asset Volatility calculation."
+      → "asset volatility calculation exclusion criteria reasoning"
+ 
+      "In the footnote on the IPO value, it is noted that it is based on
+       an implied value based on the original issuance price of Series H1
+       of 84.57 at 12.5%. However, should this be adjusted to assume some
+       type of rate of return in an IPO exit for the Series H-1?"
+      → "IPO exit value adjustment preferred stock rate of return
+         liquidation preference Series H"
+ 
+    Falls back to the original query if the LLM call fails, so the
+    first pass still runs correctly.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "You are a semantic search assistant for an audit database.\n\n"
+                    "Extract the core concept from the following audit query. "
+                    "Output only 5–10 keywords or a short phrase that captures "
+                    "the essential meaning — what topic, method, or issue the "
+                    "question is fundamentally about. Remove specific numeric "
+                    "values, percentages, company names, and question phrasing. "
+                    "Output only the concept phrase, nothing else.\n\n"
+                    f"Query: {query}"
+                )
+            }],
+            temperature=0.0,
+            max_tokens=60,
+        )
+        concept = resp.choices[0].message.content.strip()
+        return concept if concept else query
+    except Exception as e:
+        print(f"[Concept extraction error] {e}")
+        return query
+ 
+ 
+# ─────────────────────────────────────────────────────────────
+# DB search — two-pass concept-aware search
+# ─────────────────────────────────────────────────────────────
+ 
+def search_db_records(query_embedding: list, query_text: str) -> dict:
+    """
+    Two-pass search for maximum recall on same-concept variations:
+ 
+    Pass 1 — Raw query embedding (threshold 0.70):
+        Catches exact and near-exact matches. Same concept, same or similar phrasing.
+ 
+    Pass 2 — Core concept embedding (threshold 0.60):
+        Strips specific numbers and filler words, re-embeds, searches again.
+        Catches same-concept records with different numeric values.
+        e.g. "unsystematic risk premium 5%" finds "...3%" "...8%" "...10.5%"
+ 
+    Results from both passes are merged, deduplicated by serial_no, and
+    sorted best-score-first. Hard cap of DB_MAX_RESULTS applied after merge.
+ 
+    Returns {"strong": [...], "partial": [...]} where:
+        strong  = score >= DB_STRONG_THRESHOLD (0.82)
+        partial = score in [DB_CONCEPT_THRESHOLD, DB_STRONG_THRESHOLD) (0.60–0.82)
     """
     records_with_emb = list(
         AuditRecord.objects.exclude(question_embedding__isnull=True)
-        .values("question_embedding", "serial_no", "question", "response")
+        .values("question_embedding", "serial_no", "type", "project", "auditor", "question", "response")
     )
     records_without_emb = list(
         AuditRecord.objects.filter(question_embedding__isnull=True)
-        .values("id", "serial_no", "question", "response")
+        .values("id", "serial_no", "type", "project", "auditor", "question", "response")
     )
  
-    scored = []
- 
-    # Fast path: pre-stored vectors — pure numpy, zero API calls
-    for r in records_with_emb:
-        score = cosine_similarity(query_embedding, r["question_embedding"])
-        if score >= DB_PARTIAL_THRESHOLD:
-            scored.append({
-                "score":     score,
-                "serial_no": r["serial_no"],
-                "question":  r["question"],
-                "response":  r["response"],
-            })
- 
-    # Slow fallback: records missing embeddings (should be empty after backfill)
+    # Cache embeddings for records missing them (should be empty post-backfill)
     if records_without_emb:
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(_embed, r["question"]): r for r in records_without_emb}
             for future in as_completed(futures):
                 r = futures[future]
                 try:
-                    emb   = future.result()
-                    score = cosine_similarity(query_embedding, emb)
+                    emb = future.result()
                     AuditRecord.objects.filter(id=r["id"]).update(question_embedding=emb)
-                    if score >= DB_PARTIAL_THRESHOLD:
-                        scored.append({
-                            "score":     score,
-                            "serial_no": r["serial_no"],
-                            "question":  r["question"],
-                            "response":  r["response"],
-                        })
+                    records_with_emb.append({
+                        "question_embedding": emb,
+                        "serial_no": r["serial_no"],
+                        "type":      r["type"],
+                        "project":   r["project"],
+                        "auditor":   r["auditor"],
+                        "question":  r["question"],
+                        "response":  r["response"],
+                    })
                 except Exception as e:
                     print(f"[DB fallback embed error] {e}")
  
-    # Sort best-first, then enforce hard cap before splitting into tiers
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    scored = scored[:DB_MAX_RESULTS]   # ← hard cap: max 5 results total
+    # ── Pass 1: raw query embedding (threshold = DB_PARTIAL_THRESHOLD 0.70) ──
+    pass1_hits = {}   # serial_no → record dict
+    for r in records_with_emb:
+        score = cosine_similarity(query_embedding, r["question_embedding"])
+        if score >= DB_PARTIAL_THRESHOLD:
+            sno = r["serial_no"]
+            if sno not in pass1_hits or score > pass1_hits[sno]["score"]:
+                pass1_hits[sno] = {
+                    "score":     score,
+                    "serial_no": sno,
+                    "type":      r["type"],
+                    "project":   r["project"],
+                    "auditor":   r["auditor"],
+                    "question":  r["question"],
+                    "response":  r["response"],
+                }
  
-    strong  = [s for s in scored if s["score"] >= DB_STRONG_THRESHOLD]
-    partial = [s for s in scored if s["score"] < DB_STRONG_THRESHOLD]
+    # ── Pass 2: concept embedding (threshold = DB_CONCEPT_THRESHOLD 0.60) ────
+    # Only run if concept differs meaningfully from original query
+    pass2_hits = {}
+    core_concept = _extract_core_concept(query_text)
+    if core_concept and core_concept.lower() != query_text.lower():
+        try:
+            concept_embedding = _embed(core_concept)
+            for r in records_with_emb:
+                sno = r["serial_no"]
+                if sno in pass1_hits:
+                    continue   # already captured in pass 1, skip
+                score = cosine_similarity(concept_embedding, r["question_embedding"])
+                if score >= DB_CONCEPT_THRESHOLD:
+                    if sno not in pass2_hits or score > pass2_hits[sno]["score"]:
+                        pass2_hits[sno] = {
+                            "score":     score,
+                            "serial_no": sno,
+                            "type":      r["type"],
+                            "project":   r["project"],
+                            "auditor":   r["auditor"],
+                            "question":  r["question"],
+                            "response":  r["response"],
+                        }
+        except Exception as e:
+            print(f"[Concept embed error] {e}")
+ 
+    # ── Merge, sort, cap ──────────────────────────────────────────────────────
+    all_hits = list(pass1_hits.values()) + list(pass2_hits.values())
+    all_hits.sort(key=lambda x: x["score"], reverse=True)
+    all_hits = all_hits[:DB_MAX_RESULTS]
+ 
+    strong  = [h for h in all_hits if h["score"] >= DB_STRONG_THRESHOLD]
+    partial = [h for h in all_hits if h["score"] < DB_STRONG_THRESHOLD]
  
     return {"strong": strong, "partial": partial}
  
@@ -550,7 +636,7 @@ class RunAIScreenStreamView(APIView):
                 # ── Step 1: DB search (tiered, multi-match) ───────────────────
                 db_results = {"strong": [], "partial": []}
                 try:
-                    db_results = search_db_records(query_embedding)
+                    db_results = search_db_records(query_embedding, query)
                 except Exception as e:
                     print(f"DB search error: {e}")
  
@@ -594,6 +680,9 @@ class RunAIScreenStreamView(APIView):
                     for match in deduped_matches:
                         yield _sse("db_match", {
                             "s_no":     match["serial_no"],
+                            "type":     match["type"],
+                            "project":  match["project"],
+                            "auditor":  match["auditor"],
                             "question": match["question"],
                             "answer":   match["response"],
                             "score":    round(match["score"], 4),
