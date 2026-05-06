@@ -3,72 +3,91 @@
 # Run once after migration:
 #   python manage.py backfill_audit_embeddings
 #
-# Safe to re-run — skips records that already have embeddings.
+# Safe to re-run:
+#   - Skips records where BOTH question_embedding and response_embedding exist.
+#   - Re-processes records where either field is still null.
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.core.management.base import BaseCommand
 from openai import OpenAI
+from django.db import models
 
 from audit.models import AuditRecord
 
-client = OpenAI()
+client  = OpenAI()
+BATCH   = 50    # records per OpenAI batch call (max 2048 inputs per call)
+WORKERS = 5     # parallel batches
 
-BATCH_SIZE = 50       # records per batch (OpenAI allows up to 2048 inputs per call)
-MAX_WORKERS = 5       # parallel batches
 
-
-def embed_batch(records):
-    """Embed a batch of AuditRecord objects in a single OpenAI API call."""
-    texts = [r.question for r in records]
+def _embed_texts(texts: list) -> list:
+    """Embed a list of texts in a single API call. Returns list of vectors."""
     response = client.embeddings.create(
         model="text-embedding-3-small",
         input=texts,
     )
-    embeddings = [item.embedding for item in response.data]
-    return list(zip(records, embeddings))
+    return [item.embedding for item in response.data]
 
 
 class Command(BaseCommand):
-    help = "Backfill question_embedding for all AuditRecord rows that are missing it."
+    help = (
+        "Backfill question_embedding and response_embedding for all "
+        "AuditRecord rows that are missing either field."
+    )
 
     def handle(self, *args, **options):
-        qs = AuditRecord.objects.filter(question_embedding__isnull=True)
+        # Records missing at least one embedding
+        qs = AuditRecord.objects.filter(
+            models.Q(question_embedding__isnull=True) |
+            models.Q(response_embedding__isnull=True)
+        )
         total = qs.count()
 
         if total == 0:
-            self.stdout.write(self.style.SUCCESS("All records already have embeddings. Nothing to do."))
+            self.stdout.write(self.style.SUCCESS(
+                "All records already have both embeddings. Nothing to do."
+            ))
             return
 
         self.stdout.write(f"Backfilling embeddings for {total} records...")
 
         records = list(qs)
-        batches = [records[i:i + BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
-
+        batches = [records[i:i + BATCH] for i in range(0, len(records), BATCH)]
         done = 0
         failed = 0
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            future_to_batch = {pool.submit(embed_batch, b): b for b in batches}
+        def process_batch(batch):
+            # Embed questions and responses in two separate batch calls
+            # (keeps them independent — response text can be very long)
+            q_texts = [r.question for r in batch]
+            r_texts = [r.response for r in batch]
 
+            q_embeddings = _embed_texts(q_texts)
+            r_embeddings = _embed_texts(r_texts)
+
+            updates = []
+            for record, q_emb, r_emb in zip(batch, q_embeddings, r_embeddings):
+                record.question_embedding = q_emb
+                record.response_embedding = r_emb
+                updates.append(record)
+            return updates
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            future_to_batch = {pool.submit(process_batch, b): b for b in batches}
             for future in as_completed(future_to_batch):
                 try:
-                    pairs = future.result()
-                    bulk_update = []
-                    for record, embedding in pairs:
-                        record.question_embedding = embedding
-                        bulk_update.append(record)
-
-                    AuditRecord.objects.bulk_update(bulk_update, ["question_embedding"])
-                    done += len(bulk_update)
+                    updates = future.result()
+                    AuditRecord.objects.bulk_update(
+                        updates, ["question_embedding", "response_embedding"]
+                    )
+                    done += len(updates)
                     self.stdout.write(f"  ✓ {done}/{total} embedded")
-
                 except Exception as e:
                     failed += len(future_to_batch[future])
                     self.stdout.write(self.style.ERROR(f"  ✗ Batch failed: {e}"))
-                    time.sleep(1)  # back off briefly on error
+                    time.sleep(1)
 
         self.stdout.write(self.style.SUCCESS(
-            f"\nDone. {done} records embedded, {failed} failed."
+            f"\nDone. {done} records embedded successfully, {failed} failed."
         ))

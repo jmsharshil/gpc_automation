@@ -13,6 +13,7 @@ class AuditRecord(models.Model):
 
     # Pre-stored embedding — computed once, reused on every query (no N API calls)
     question_embedding = models.JSONField(null=True, blank=True)
+    response_embedding = models.JSONField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.serial_no} - {self.project}"

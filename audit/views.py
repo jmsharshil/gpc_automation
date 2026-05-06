@@ -218,37 +218,25 @@ def get_queries_from_request(data) -> list:
     return []
  
  
-def _extract_core_concept(query: str) -> str:
+def _generate_query_expansions(query: str) -> list[str]:
     """
-    Uses the LLM to extract the core semantic concept from a query.
+    Uses the LLM to generate multiple semantically equivalent phrasings
+    of the query — synonyms, related terms, domain variations.
  
-    This replaces the old regex-based approach which only worked for
-    numeric variations (e.g. "5%" vs "10%") and failed on all other
-    query types.
+    This solves the core problem: a short or specific query like
+    "Please provide support for exit term" has a narrow embedding that
+    misses semantically related DB records phrased as "exit scenario",
+    "exit planning", "exit duration", "liquidity event term", etc.
  
-    The LLM understands what the question is actually asking about and
-    produces a concept phrase that captures meaning independent of:
-      - specific numeric values
-      - question phrasing / sentence structure
-      - filler words and hedging language
+    By generating N alternate phrasings and embedding each one separately,
+    we cast a wider semantic net while staying on-topic. Each phrasing
+    is a genuine restatement of the same underlying question — not noise.
  
-    Examples:
-      "Why have you selected an unsystematic risk premium of 5%?"
-      → "unsystematic risk premium selection rationale justification"
+    Returns a list of strings: [core_concept, phrasing_1, phrasing_2, ...]
+    The first item is always the core concept (numbers/filler stripped).
+    Subsequent items are domain-aware alternate phrasings.
  
-      "Please provide your reasoning for excluding Ideal Power in the
-       Asset Volatility calculation."
-      → "asset volatility calculation exclusion criteria reasoning"
- 
-      "In the footnote on the IPO value, it is noted that it is based on
-       an implied value based on the original issuance price of Series H1
-       of 84.57 at 12.5%. However, should this be adjusted to assume some
-       type of rate of return in an IPO exit for the Series H-1?"
-      → "IPO exit value adjustment preferred stock rate of return
-         liquidation preference Series H"
- 
-    Falls back to the original query if the LLM call fails, so the
-    first pass still runs correctly.
+    Falls back to [query] if the LLM call fails — Pass 1 still runs normally.
     """
     try:
         resp = client.chat.completions.create(
@@ -256,131 +244,192 @@ def _extract_core_concept(query: str) -> str:
             messages=[{
                 "role": "user",
                 "content": (
-                    "You are a semantic search assistant for an audit database.\n\n"
-                    "Extract the core concept from the following audit query. "
-                    "Output only 5–10 keywords or a short phrase that captures "
-                    "the essential meaning — what topic, method, or issue the "
-                    "question is fundamentally about. Remove specific numeric "
-                    "values, percentages, company names, and question phrasing. "
-                    "Output only the concept phrase, nothing else.\n\n"
+                    "You are a semantic search assistant for a professional audit database.\n\n"
+                    "Given the audit query below, generate 4 outputs:\n"
+                    "1. Core concept: 5-8 keywords capturing the essential topic "
+                    "(remove specific numbers, percentages, company names, question phrasing)\n"
+                    "2. Alternate phrasing 1: rephrase the question using different but "
+                    "semantically equivalent audit terminology\n"
+                    "3. Alternate phrasing 2: rephrase again using related domain terms "
+                    "or synonyms an auditor might use\n"
+                    "4. Alternate phrasing 3: a broader version of the question that "
+                    "captures related concepts\n\n"
+                    "Output exactly 4 lines, one per item, no labels, no numbering, "
+                    "no extra text.\n\n"
                     f"Query: {query}"
                 )
             }],
             temperature=0.0,
-            max_tokens=60,
+            max_tokens=200,
         )
-        concept = resp.choices[0].message.content.strip()
-        return concept if concept else query
+        lines = [
+            line.strip()
+            for line in resp.choices[0].message.content.strip().split("\n")
+            if line.strip()
+        ]
+        # Return up to 4 expansions, always include at least the first line
+        return lines[:4] if lines else [query]
     except Exception as e:
-        print(f"[Concept extraction error] {e}")
-        return query
+        print(f"[Query expansion error] {e}")
+        return [query]
  
  
 # ─────────────────────────────────────────────────────────────
-# DB search — two-pass concept-aware search
+# DB search — multi-pass query expansion search
 # ─────────────────────────────────────────────────────────────
  
 def search_db_records(query_embedding: list, query_text: str) -> dict:
     """
-    Two-pass search for maximum recall on same-concept variations:
- 
-    Pass 1 — Raw query embedding (threshold 0.70):
-        Catches exact and near-exact matches. Same concept, same or similar phrasing.
- 
-    Pass 2 — Core concept embedding (threshold 0.60):
-        Strips specific numbers and filler words, re-embeds, searches again.
-        Catches same-concept records with different numeric values.
-        e.g. "unsystematic risk premium 5%" finds "...3%" "...8%" "...10.5%"
- 
-    Results from both passes are merged, deduplicated by serial_no, and
-    sorted best-score-first. Hard cap of DB_MAX_RESULTS applied after merge.
- 
-    Returns {"strong": [...], "partial": [...]} where:
-        strong  = score >= DB_STRONG_THRESHOLD (0.82)
-        partial = score in [DB_CONCEPT_THRESHOLD, DB_STRONG_THRESHOLD) (0.60–0.82)
+    Improved multi-pass semantic + hybrid search with:
+    - question + response embedding matching
+    - keyword boosting
+    - dynamic thresholding
+    - top-k fallback (prevents low result issue)
+    - full backward compatibility
     """
+
+    # ─────────────────────────────────────────────
+    # Fetch records
+    # ─────────────────────────────────────────────
     records_with_emb = list(
-        AuditRecord.objects.exclude(question_embedding__isnull=True)
-        .values("question_embedding", "serial_no", "type", "project", "auditor", "question", "response")
+        AuditRecord.objects.exclude(
+            question_embedding__isnull=True,
+            response_embedding__isnull=True,
+        )
+        .values(
+            "question_embedding", "response_embedding",
+            "serial_no", "type", "project", "auditor", "question", "response",
+        )
     )
-    records_without_emb = list(
-        AuditRecord.objects.filter(question_embedding__isnull=True)
-        .values("id", "serial_no", "type", "project", "auditor", "question", "response")
-    )
- 
-    # Cache embeddings for records missing them (should be empty post-backfill)
-    if records_without_emb:
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(_embed, r["question"]): r for r in records_without_emb}
-            for future in as_completed(futures):
-                r = futures[future]
-                try:
-                    emb = future.result()
-                    AuditRecord.objects.filter(id=r["id"]).update(question_embedding=emb)
-                    records_with_emb.append({
-                        "question_embedding": emb,
-                        "serial_no": r["serial_no"],
-                        "type":      r["type"],
-                        "project":   r["project"],
-                        "auditor":   r["auditor"],
-                        "question":  r["question"],
-                        "response":  r["response"],
-                    })
-                except Exception as e:
-                    print(f"[DB fallback embed error] {e}")
- 
-    # ── Pass 1: raw query embedding (threshold = DB_PARTIAL_THRESHOLD 0.70) ──
-    pass1_hits = {}   # serial_no → record dict
-    for r in records_with_emb:
-        score = cosine_similarity(query_embedding, r["question_embedding"])
-        if score >= DB_PARTIAL_THRESHOLD:
-            sno = r["serial_no"]
-            if sno not in pass1_hits or score > pass1_hits[sno]["score"]:
-                pass1_hits[sno] = {
-                    "score":     score,
-                    "serial_no": sno,
-                    "type":      r["type"],
-                    "project":   r["project"],
-                    "auditor":   r["auditor"],
-                    "question":  r["question"],
-                    "response":  r["response"],
-                }
- 
-    # ── Pass 2: concept embedding (threshold = DB_CONCEPT_THRESHOLD 0.60) ────
-    # Only run if concept differs meaningfully from original query
-    pass2_hits = {}
-    core_concept = _extract_core_concept(query_text)
-    if core_concept and core_concept.lower() != query_text.lower():
+
+    # ─────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────
+    def normalize_query(q: str) -> str:
+        return q.lower().replace("please provide", "").strip()
+
+    def keyword_score(query: str, text: str) -> float:
+        q_words = set(query.lower().split())
+        t_words = set(text.lower().split())
+        if not q_words:
+            return 0.0
+        return len(q_words & t_words) / len(q_words)
+
+    normalized_query = normalize_query(query_text)
+
+    # ─────────────────────────────────────────────
+    # Scoring function
+    # ─────────────────────────────────────────────
+    def score_records(embedding: list):
+        scored = []
+
+        for r in records_with_emb:
+            try:
+                # Semantic similarity (question + response)
+                q_score = cosine_similarity(embedding, r["question_embedding"])
+                r_score = cosine_similarity(embedding, r["response_embedding"])
+                semantic_score = max(q_score, r_score)
+
+                # Keyword boost
+                kw_score = keyword_score(normalized_query, r["question"])
+
+                # Hybrid score
+                final_score = (0.75 * semantic_score) + (0.25 * kw_score)
+
+                scored.append((final_score, r))
+            except Exception as e:
+                print(f"[Scoring error] {e}")
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
+    # ─────────────────────────────────────────────
+    # Pass 0 — Raw query
+    # ─────────────────────────────────────────────
+    scored_all = score_records(query_embedding)
+
+    # ─────────────────────────────────────────────
+    # Query expansion (safe fallback if fails)
+    # ─────────────────────────────────────────────
+    try:
+        expansions = _generate_query_expansions(query_text)
+    except Exception as e:
+        print(f"[Expansion error] {e}")
+        expansions = [query_text]
+
+    # ─────────────────────────────────────────────
+    # Expansion passes
+    # ─────────────────────────────────────────────
+    expansion_results = []
+
+    def process_expansion(text):
         try:
-            concept_embedding = _embed(core_concept)
-            for r in records_with_emb:
-                sno = r["serial_no"]
-                if sno in pass1_hits:
-                    continue   # already captured in pass 1, skip
-                score = cosine_similarity(concept_embedding, r["question_embedding"])
-                if score >= DB_CONCEPT_THRESHOLD:
-                    if sno not in pass2_hits or score > pass2_hits[sno]["score"]:
-                        pass2_hits[sno] = {
-                            "score":     score,
-                            "serial_no": sno,
-                            "type":      r["type"],
-                            "project":   r["project"],
-                            "auditor":   r["auditor"],
-                            "question":  r["question"],
-                            "response":  r["response"],
-                        }
+            emb = _embed(text)
+            return score_records(emb)
         except Exception as e:
-            print(f"[Concept embed error] {e}")
- 
-    # ── Merge, sort, cap ──────────────────────────────────────────────────────
-    all_hits = list(pass1_hits.values()) + list(pass2_hits.values())
-    all_hits.sort(key=lambda x: x["score"], reverse=True)
-    all_hits = all_hits[:DB_MAX_RESULTS]
- 
-    strong  = [h for h in all_hits if h["score"] >= DB_STRONG_THRESHOLD]
-    partial = [h for h in all_hits if h["score"] < DB_STRONG_THRESHOLD]
- 
-    return {"strong": strong, "partial": partial}
+            print(f"[Expansion scoring error] {e}")
+            return []
+
+    with ThreadPoolExecutor(max_workers=min(5, len(expansions))) as pool:
+        futures = [pool.submit(process_expansion, exp) for exp in expansions]
+
+        for future in as_completed(futures):
+            try:
+                expansion_results.extend(future.result())
+            except Exception as e:
+                print(f"[Expansion future error] {e}")
+
+    # ─────────────────────────────────────────────
+    # Merge all scores (keep best per serial_no)
+    # ─────────────────────────────────────────────
+    merged_scores = {}
+
+    for score, r in scored_all + expansion_results:
+        sno = r["serial_no"]
+
+        if sno not in merged_scores or score > merged_scores[sno]["score"]:
+            merged_scores[sno] = {
+                "score":     score,
+                "serial_no": sno,
+                "type":      r["type"],
+                "project":   r["project"],
+                "auditor":   r["auditor"],
+                "question":  r["question"],
+                "response":  r["response"],
+            }
+
+    merged = list(merged_scores.values())
+    merged.sort(key=lambda x: x["score"], reverse=True)
+
+    # ─────────────────────────────────────────────
+    # Thresholds (relaxed)
+    # ─────────────────────────────────────────────
+    STRONG_THRESHOLD  = 0.75
+    PARTIAL_THRESHOLD = 0.55
+
+    strong  = [m for m in merged if m["score"] >= STRONG_THRESHOLD]
+    partial = [m for m in merged if PARTIAL_THRESHOLD <= m["score"] < STRONG_THRESHOLD]
+
+    # ─────────────────────────────────────────────
+    # 🔥 CRITICAL: Top-K fallback (prevents 1-result issue)
+    # ─────────────────────────────────────────────
+    MIN_RESULTS = 5
+    MAX_RESULTS = DB_MAX_RESULTS  # keep your existing cap
+
+    if len(strong) + len(partial) < MIN_RESULTS:
+        fallback = merged[:MAX_RESULTS]
+
+        strong  = fallback[:3]   # first few as strong
+        partial = fallback[3:]
+
+    else:
+        strong  = strong[:MAX_RESULTS]
+        partial = partial[:MAX_RESULTS]
+
+    return {
+        "strong": strong,
+        "partial": partial,
+    }
  
  
 # ─────────────────────────────────────────────────────────────
@@ -705,34 +754,46 @@ class RunAIScreenStreamView(APIView):
                         for m in deduped_matches[:10]   # cap at 10 for prompt size
                     )
  
-                ai_prompt = f"""You are a senior audit professional with Big Four standards (Deloitte, PwC, EY, KPMG).
+                ai_prompt = f"""You are a senior valuation and audit support professional operating at Big Four standards (Deloitte, PwC, EY, KPMG), with expertise in 409A valuations, purchase price allocations (ASC 805), business enterprise valuations, ASC 718, convertible instrument valuation, debt valuation, and estate and gift tax valuation.
  
-Your task is to write a single, well-structured paragraph that provides an audit-defensible answer to the question below.
+Your task is to write a single, well-structured paragraph that provides an audit-defensible response to the question below. The response must be suitable for review by auditors, valuation specialists, tax advisors, and regulators.
  
 STRICT REQUIREMENTS:
-- Write exactly ONE well-structured paragraph. No bullet points. No numbered lists. No sub-headings.
-- The answer must be fact-based, clear, and logically structured.
-- It must provide traceability and logical justification for any conclusions.
-- It must align with risk mitigation and professional audit requirements.
-- It must be suitable for professional audit review at Big Four standards.
-- Do NOT hallucinate. If a fact is uncertain, qualify it explicitly.
-- If relevant database entries or document context are provided below, incorporate
-  the most pertinent information into your answer naturally within the paragraph.
-- If no relevant context exists, answer from industry-standard audit knowledge.
+- Write exactly ONE well-structured paragraph. No bullet points, numbering, or sub-headings.
+- The response must be fact-based, clear, and logically structured.
+- Provide traceability and support for all conclusions, including assumptions and methodologies where relevant.
+- Use appropriate professional valuation terminology and concepts.
+- Explicitly state the valuation approach or framework where relevant (e.g., income, market, or cost approach) and justify its appropriateness.
+- Clearly identify key assumptions (explicit or implicit) and ensure they are reasonable, supportable, and consistent with the context.
+- Do not reach conclusions that extend beyond the available evidence; where information is insufficient, explicitly state the limitation and provide a conditional or alternative view.
+- Use precise, measured language and avoid absolute statements unless fully supported.
+- Ensure the response is written such that an independent reviewer can understand the rationale, assumptions, and conclusion without additional clarification.
+- Align with applicable authoritative guidance (e.g., ASC 820, ASC 805, ASC 718, AICPA valuation guidance, IRS standards), applying the most relevant standard based on the context.
+- Consider materiality where relevant and avoid overemphasis on immaterial factors.
+- Maintain independence and avoid bias.
+ 
+DATABASE ENTRIES:
+{db_context_for_prompt or "(none)"}
+ 
+DATABASE USAGE LIMITATION:
+The database entries are provided only as reference examples of how similar questions were addressed in other projects. Use them strictly for understanding response structure, audit-defensible reasoning style, tone, and level of analytical rigor. Treat all such entries as originating from separate engagements and maintain strict professional independence. Do NOT copy, rely on, or incorporate any project-specific quantitative or qualitative information from these entries, including but not limited to assumptions, financial data, company-specific facts, valuation inputs, multiples, discounts, forecasts, risk factors, dates, or conclusions, unless such information is independently supported by the current question, document context, or notes.
+ 
+DOCUMENT CONTEXT:
+{doc_context_text or "(no document uploaded)"}
+ 
+DOCUMENT USAGE:
+If document context is provided, prioritize it as the primary source of factual support and ensure conclusions are directly traceable to it.
+ 
+NOTES:
+{note_context or "(none provided)"}
+ 
+NOTES USAGE:
+Incorporate any tone, emphasis, or specific instructions provided in the notes while maintaining professional audit standards.
  
 QUESTION:
 {query}
  
-DATABASE ENTRIES (for reference — incorporate relevant facts if applicable):
-{db_context_for_prompt or "(none)"}
- 
-DOCUMENT CONTEXT (for reference — use if relevant):
-{doc_context_text or "(no document uploaded)"}
- 
-NOTES (tone/format guidance and supplementary context):
-{note_context or "(none provided)"}
- 
-Write one audit-defensible paragraph now:"""
+Write one audit-defensible valuation paragraph now:"""
  
                 try:
                     ai_response = client.chat.completions.create(

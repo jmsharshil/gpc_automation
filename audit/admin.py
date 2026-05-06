@@ -8,7 +8,7 @@ class AuditRecordAdmin(admin.ModelAdmin):
     search_fields = ("project", "type", "classification", "auditor", "question")
     list_filter = ("type", "classification", "project")
     ordering = ("serial_no",)
-    readonly_fields = ("question_embedding",)
+    readonly_fields = ("question_embedding","response_embedding")
 
 
 @admin.register(DocumentChunk)
