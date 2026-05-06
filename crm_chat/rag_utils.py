@@ -414,7 +414,7 @@ def sanitize_image_for_ocr(image_bytes: bytes) -> bytes:
                 arr[labeled == region_id] = [255, 255, 255]
 
     except Exception as e:
-        logger.warning("cv2 not available, using fallback: %s", e)
+        # logger.warning("cv2 not available, using fallback: %s", e)
 
         # 🔁 Fallback: simple masking (no connected components)
         arr[combined_mask] = [255, 255, 255]

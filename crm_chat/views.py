@@ -634,12 +634,12 @@ import time
 import concurrent.futures
 
 
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.DEBUG,
-    format='%(levelname)s %(name)s %(message)s',
-    force=True  # overrides any existing config
-)
+# logging.basicConfig(
+#     stream=sys.stdout,
+#     level=logging.DEBUG,
+#     format='%(levelname)s %(name)s %(message)s',
+#     force=True  # overrides any existing config
+# )
 
 logger = logging.getLogger(__name__)
 logger.info("🔥 VIEWS.PY LOADED — logger name: %s", __name__)
@@ -688,61 +688,61 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
     """
     doc_processing = None
     try:
-        logger.info(
-            "Starting PDF processing for chat_id=%s pdf_bytes=%s",
-            chat.id,
-            len(file_bytes) if file_bytes is not None else 0,
-        )
+        # logger.info(
+        #     "Starting PDF processing for chat_id=%s pdf_bytes=%s",
+        #     chat.id,
+        #     len(file_bytes) if file_bytes is not None else 0,
+        # )
  
         # Extract text — async parallel OCR for image-based pages
         pages_text = await extract_text_from_uploaded_file_async(file_name, file_bytes)
  
         page_text_lengths = [len(text or "") for text in pages_text.values()]
-        logger.info(
-            "Extracted PDF text for chat_id=%s pages=%s non_empty_pages=%s total_chars=%s",
-            chat.id,
-            len(pages_text),
-            sum(1 for length in page_text_lengths if length > 0),
-            sum(page_text_lengths),
-        )
+        # logger.info(
+        #     "Extracted PDF text for chat_id=%s pages=%s non_empty_pages=%s total_chars=%s",
+        #     chat.id,
+        #     len(pages_text),
+        #     sum(1 for length in page_text_lengths if length > 0),
+        #     sum(page_text_lengths),
+        # )
  
         # Create chunks
-        logger.info(
-            "Creating chunks for chat_id=%s chunk_size=%s overlap=%s",
-            chat.id,
-            1000,
-            200,
-        )
+        # logger.info(
+        #     "Creating chunks for chat_id=%s chunk_size=%s overlap=%s",
+        #     chat.id,
+        #     1000,
+        #     200,
+        # )
         chunks = split_into_chunks(pages_text)
-        if chunks:
-            logger.info(
-                "Created chunks for chat_id=%s chunk_count=%s first_chunk=%s last_chunk=%s",
-                chat.id,
-                len(chunks),
-                {
-                    "page_number": chunks[0]["page_number"],
-                    "chunk_index": chunks[0]["chunk_index"],
-                    "char_count": chunks[0]["char_count"],
-                },
-                {
-                    "page_number": chunks[-1]["page_number"],
-                    "chunk_index": chunks[-1]["chunk_index"],
-                    "char_count": chunks[-1]["char_count"],
-                },
-            )
-        else:
-            logger.warning("No chunks were created for chat_id=%s", chat.id)
+        # if chunks:
+        #     logger.info(
+        #         "Created chunks for chat_id=%s chunk_count=%s first_chunk=%s last_chunk=%s",
+        #         chat.id,
+        #         len(chunks),
+        #         {
+        #             "page_number": chunks[0]["page_number"],
+        #             "chunk_index": chunks[0]["chunk_index"],
+        #             "char_count": chunks[0]["char_count"],
+        #         },
+        #         {
+        #             "page_number": chunks[-1]["page_number"],
+        #             "chunk_index": chunks[-1]["chunk_index"],
+        #             "char_count": chunks[-1]["char_count"],
+        #         },
+        #     )
+        # else:
+        #     logger.warning("No chunks were created for chat_id=%s", chat.id)
  
         # Update document processing status
         doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
             chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
         )
-        logger.info(
-            "DocumentProcessing ready for chat_id=%s processing_id=%s status=%s",
-            chat.id,
-            doc_processing.id,
-            doc_processing.status,
-        )
+        # logger.info(
+        #     "DocumentProcessing ready for chat_id=%s processing_id=%s status=%s",
+        #     chat.id,
+        #     doc_processing.id,
+        #     doc_processing.status,
+        # )
         doc_processing.total_pages = len(pages_text)
         await sync_to_async(doc_processing.save)()
  
@@ -755,14 +755,14 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
         for batch_idx in range(0, len(chunks), chunk_batch_size):
             batch_chunks = chunks[batch_idx:batch_idx + chunk_batch_size]
             batch_texts = [chunk['text'] for chunk in batch_chunks]
-            logger.info(
-                "Embedding chunk batch for chat_id=%s batch_number=%s batch_size=%s chunk_index_range=%s-%s",
-                chat.id,
-                batch_idx // chunk_batch_size + 1,
-                len(batch_chunks),
-                batch_chunks[0]['chunk_index'] if batch_chunks else None,
-                batch_chunks[-1]['chunk_index'] if batch_chunks else None,
-            )
+            # logger.info(
+            #     "Embedding chunk batch for chat_id=%s batch_number=%s batch_size=%s chunk_index_range=%s-%s",
+            #     chat.id,
+            #     batch_idx // chunk_batch_size + 1,
+            #     len(batch_chunks),
+            #     batch_chunks[0]['chunk_index'] if batch_chunks else None,
+            #     batch_chunks[-1]['chunk_index'] if batch_chunks else None,
+            # )
  
             try:
                 response = client.embeddings.create(
@@ -774,13 +774,13 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embedding_vectors.extend(batch_embeddings)
  
-                logger.info(
-                    "Embedded chunk batch for chat_id=%s batch_number=%s embedded_count=%s total_embeddings=%s",
-                    chat.id,
-                    batch_idx // chunk_batch_size + 1,
-                    len(batch_embeddings),
-                    len(all_embedding_vectors),
-                )
+                # logger.info(
+                #     "Embedded chunk batch for chat_id=%s batch_number=%s embedded_count=%s total_embeddings=%s",
+                #     chat.id,
+                #     batch_idx // chunk_batch_size + 1,
+                #     len(batch_embeddings),
+                #     len(all_embedding_vectors),
+                # )
             except Exception as e:
                 logger.exception(
                     "Embedding batch failed for chat_id=%s batch_number=%s batch_size=%s",
@@ -805,18 +805,18 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
             )
             chunk_objects.append(chunk_obj)
  
-        logger.info(
-            "Saving chunk objects for chat_id=%s chunk_object_count=%s",
-            chat.id,
-            len(chunk_objects),
-        )
+        # logger.info(
+        #     "Saving chunk objects for chat_id=%s chunk_object_count=%s",
+        #     chat.id,
+        #     len(chunk_objects),
+        # )
         await sync_to_async(DocumentChunk.objects.filter(chat=chat).delete)()
         await sync_to_async(DocumentChunk.objects.bulk_create)(chunk_objects, batch_size=100)
-        logger.info(
-            "Saved document chunks for chat_id=%s saved_count=%s",
-            chat.id,
-            len(chunk_objects),
-        )
+        # logger.info(
+        #     "Saved document chunks for chat_id=%s saved_count=%s",
+        #     chat.id,
+        #     len(chunk_objects),
+        # )
  
         # Update processing status
         doc_processing.status = 'completed'
@@ -827,12 +827,12 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
         # Update chat
         chat.has_document = True
         await sync_to_async(chat.save)()
-        logger.info(
-            "Completed PDF processing for chat_id=%s total_pages=%s total_chunks=%s",
-            chat.id,
-            len(pages_text),
-            len(chunks),
-        )
+        # logger.info(
+        #     "Completed PDF processing for chat_id=%s total_pages=%s total_chunks=%s",
+        #     chat.id,
+        #     len(pages_text),
+        #     len(chunks),
+        # )
  
         return len(chunks)
  
@@ -972,12 +972,12 @@ class SendMessageAPIView(APIView):
  
         allowed_ext = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
  
-        logger.info(
-            "SendMessageAPIView received request chat_id=%s user_id=%s has_attachment=%s "
-            "attachment_name=%s attachment_content_type=%s user_text_length=%s has_document=%s",
-            chat.id, user.id, bool(attachment), attachment_name,
-            attachment_content_type, len(user_text), chat.has_document,
-        )
+        # logger.info(
+        #     "SendMessageAPIView received request chat_id=%s user_id=%s has_attachment=%s "
+        #     "attachment_name=%s attachment_content_type=%s user_text_length=%s has_document=%s",
+        #     chat.id, user.id, bool(attachment), attachment_name,
+        #     attachment_content_type, len(user_text), chat.has_document,
+        # )
  
         if not user_text and not attachment:
             return Response(
@@ -988,10 +988,10 @@ class SendMessageAPIView(APIView):
         # --- Handle file upload for RAG ---
         if attachment_name.lower().endswith(allowed_ext):
             file_bytes = attachment.read()
-            logger.info(
-                "Read uploaded file bytes for chat_id=%s attachment_name=%s byte_count=%s",
-                chat.id, attachment_name, len(file_bytes),
-            )
+            # logger.info(
+            #     "Read uploaded file bytes for chat_id=%s attachment_name=%s byte_count=%s",
+            #     chat.id, attachment_name, len(file_bytes),
+            # )
  
             # Save user message
             user_msg = Message.objects.create(
@@ -1002,24 +1002,24 @@ class SendMessageAPIView(APIView):
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
             )
-            logger.info(
-                "Created user message for chat_id=%s message_id=%s content=%s",
-                chat.id, user_msg.id, user_msg.content[:80],
-            )
+            # logger.info(
+            #     "Created user message for chat_id=%s message_id=%s content=%s",
+            #     chat.id, user_msg.id, user_msg.content[:80],
+            # )
  
             # Process file in isolated thread (fixes Windows IocpProactor conflict)
             try:
-                logger.info("Starting PDF processing for chat_id=%s", chat.id)
+                # logger.info("Starting PDF processing for chat_id=%s", chat.id)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
                         _run_pdf_processing, chat, file_bytes, attachment_name
                     )
                     num_chunks = future.result()
  
-                logger.info(
-                    "PDF processing completed for chat_id=%s chunk_count=%s",
-                    chat.id, num_chunks,
-                )
+                # logger.info(
+                #     "PDF processing completed for chat_id=%s chunk_count=%s",
+                #     chat.id, num_chunks,
+                # )
  
                 if not user_text:
                     completion_msg = Message.objects.create(
@@ -1140,7 +1140,7 @@ class SendMessageAPIView(APIView):
                 'total_tokens': resp.usage.total_tokens,
             }
  
-            logger.info("OpenAI response: %s", usage)
+            # logger.info("OpenAI response: %s", usage)
  
             assistant_msg = Message.objects.create(
                 chat=chat,
@@ -1374,10 +1374,10 @@ class StreamingChatAPIView(APIView):
                     content=assistant_text,
                     metadata={'streaming': True},
                 )
-                logger.info(
-                    "Streaming complete for chat_id=%s chars=%s",
-                    chat.id, len(assistant_text),
-                )
+                # logger.info(
+                #     "Streaming complete for chat_id=%s chars=%s",
+                #     chat.id, len(assistant_text),
+                # )
  
             except Exception as e:
                 logger.exception(
