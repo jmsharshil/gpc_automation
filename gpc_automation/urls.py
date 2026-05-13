@@ -26,6 +26,7 @@ urlpatterns = [
     path('api/v1/', include("crm_chat.urls")),
     path('api/v1/transactions/', include("transactions.urls")),
     path('api/v1/audit/', include("audit.urls")),
+    path('api/v1/article/', include("articleai.urls")),
     
 ]
 if settings.DEBUG and not settings.USE_AZURE_MEDIA:

@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'crm_chat',
     'transactions',
     'audit',
+    'articleai',
 ]
 
 REST_FRAMEWORK = {
