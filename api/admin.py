@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Company, FinancialRecord, UploadJob
+from .models import Company, FinancialRecord, UploadJob, ProjectDates
 
 
 class FinancialRecordInline(admin.TabularInline):
@@ -74,3 +74,18 @@ class UploadJobAdmin(admin.ModelAdmin):
     list_filter = ("uploaded_at", "uploaded_by")
     search_fields = ("filename", "uploaded_by__username")
     readonly_fields = ("uploaded_at",)
+
+@admin.register(ProjectDates)
+class ProjectDatesAdmin(admin.ModelAdmin):
+    list_display = (
+        'gpc_date',
+        'transaction_date',
+        'audit_date',
+        'updated_at',
+    )
+
+    search_fields = (
+        'gpc_date',
+        'transaction_date',
+        'audit_date',
+    )

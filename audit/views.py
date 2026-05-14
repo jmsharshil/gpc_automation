@@ -405,7 +405,7 @@ def search_db_records(query_embedding: list, query_text: str) -> dict:
     # Thresholds (relaxed)
     # ─────────────────────────────────────────────
     STRONG_THRESHOLD  = 0.75
-    PARTIAL_THRESHOLD = 0.55
+    PARTIAL_THRESHOLD = 0.56   # Earlier 0.55
 
     strong  = [m for m in merged if m["score"] >= STRONG_THRESHOLD]
     partial = [m for m in merged if PARTIAL_THRESHOLD <= m["score"] < STRONG_THRESHOLD]
@@ -413,11 +413,11 @@ def search_db_records(query_embedding: list, query_text: str) -> dict:
     # ─────────────────────────────────────────────
     # 🔥 CRITICAL: Top-K fallback (prevents 1-result issue)
     # ─────────────────────────────────────────────
-    MIN_RESULTS = 5
+    MIN_RESULTS = 3
     MAX_RESULTS = DB_MAX_RESULTS  # keep your existing cap
 
     if len(strong) + len(partial) < MIN_RESULTS:
-        fallback = merged[:MAX_RESULTS]
+        fallback = [m for m in merged[:MAX_RESULTS] if m["score"] >= 0.50]
 
         strong  = fallback[:3]   # first few as strong
         partial = fallback[3:]
