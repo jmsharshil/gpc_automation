@@ -44,3 +44,13 @@ class UploadJob(models.Model):
     filename = models.CharField(max_length=255, blank=True)
     summary = models.JSONField(default=dict)
     file = models.FileField(upload_to='uploads/finance/', null=True, blank=True)
+
+class ProjectDates(models.Model):
+    gpc_date = models.CharField(max_length=100, null=True, blank=True)
+    transaction_date = models.CharField(max_length=100, null=True, blank=True)
+    audit_date = models.CharField(max_length=100, null=True, blank=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return "Project Dates"

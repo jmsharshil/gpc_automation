@@ -10,8 +10,8 @@ from django.db.models import Q, Prefetch
 from rest_framework import generics
 from rest_framework.pagination import PageNumberPagination
 
-from .models import Company, FinancialRecord
-from .serializers import DashboardSummarySerializer, CompanySerializer, FinancialRecordSerializer, CompareRequestSerializer
+from .models import Company, FinancialRecord, ProjectDates
+from .serializers import DashboardSummarySerializer, CompanySerializer, FinancialRecordSerializer, CompareRequestSerializer, AdhocCompanySerializer, ProjectDatesSerializer
 from .utils_master_sheet import process_master_screening_v2
 import re
 import openai
@@ -1269,8 +1269,13 @@ class CompareAPIView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
+# Dynamic date added
+class ProjectDatesAPIView(generics.RetrieveUpdateAPIView):
+    serializer_class = ProjectDatesSerializer
 
-
+    def get_object(self):
+        obj, created = ProjectDates.objects.get_or_create(id=1)
+        return obj
 
 
 

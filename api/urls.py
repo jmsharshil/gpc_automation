@@ -1,6 +1,6 @@
 # finance/urls.py
 from django.urls import path
-from .views import ExcelUploadAPIView, DashboardSummaryAPIView, CountryListAPIView, SectorListAPIView, IndustryListAPIView, CompanyListAPIView, CompareAPIView
+from .views import ExcelUploadAPIView, DashboardSummaryAPIView, CountryListAPIView, SectorListAPIView, IndustryListAPIView, CompanyListAPIView, CompareAPIView, ProjectDatesAPIView
 
 urlpatterns = [
     path('upload-excel/', ExcelUploadAPIView.as_view(), name='upload-excel'),
@@ -13,6 +13,8 @@ urlpatterns = [
     path('api/companies/', CompanyListAPIView.as_view(), name='companies-list'),
     
     path('api/companies/compare/', CompareAPIView.as_view(), name='companies-compare'),
+    
+    path('project-dates/', ProjectDatesAPIView.as_view(), name='project-dates'),
     
     # path('companies/', CompanyListAPIView.as_view(), name='company-list'),
     # path('companies/<int:pk>/', CompanyDetailAPIView.as_view(), name='company-detail'),

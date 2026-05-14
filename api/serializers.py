@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Company, FinancialRecord
+from .models import Company, FinancialRecord, ProjectDates
 from django.conf import settings
 
 class GroupCountSerializer(serializers.Serializer):
@@ -70,3 +70,8 @@ class CompareRequestSerializer(serializers.Serializer):
                 f"Too many companies. Max allowed is {MAX_COMPANIES}."
             )
         return value
+
+class ProjectDatesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectDates
+        fields = '__all__'
