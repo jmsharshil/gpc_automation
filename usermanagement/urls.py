@@ -1,0 +1,8 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('admin-panel/', views.AdminPanelView.as_view(), name='admin-panel'),
+    path('admin-panel/analytics/', views.AdminAnalyticsView.as_view(), name='admin-panel'),
+    path('feedback/', views.WorkflowFeedbackView.as_view(),name='feed-back'),
+]

@@ -139,6 +139,11 @@ def create_or_get_user(user_data):
     given_name = user_data.get('givenName', '')
     surname = user_data.get('surname', '')
     
+    # ALLOWED_EMAILS = ["yourname@outlook.com"]
+
+    # if email not in ALLOWED_EMAILS and email.endswith("@outlook.com"):
+    #     raise Exception("This email is not allowed to login")
+    
     # Try to find existing user by Microsoft ID
     user = User.objects.filter(microsoft_id=microsoft_id).first()
     

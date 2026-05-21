@@ -409,7 +409,8 @@ def search_db_records(query_embedding: list, query_text: str) -> dict:
 
     strong  = [m for m in merged if m["score"] >= STRONG_THRESHOLD]
     partial = [m for m in merged if PARTIAL_THRESHOLD <= m["score"] < STRONG_THRESHOLD]
-
+    # for m in merged[:20]:
+    #     print(f"[SCORE DEBUG] {m['score']:.4f} | {m['question'][:80]}")
     # ─────────────────────────────────────────────
     # 🔥 CRITICAL: Top-K fallback (prevents 1-result issue)
     # ─────────────────────────────────────────────
