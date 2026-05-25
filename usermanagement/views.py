@@ -97,7 +97,7 @@ class AdminPanelView(APIView):
 
         for activity in page:
 
-            feedback_obj = activity.feedbacks.first()
+            feedbacks = activity.feedbacks.all()
 
             result.append({
                 'activity_id': activity.id,
@@ -115,16 +115,16 @@ class AdminPanelView(APIView):
                 'client_name': activity.client_name,
                 'project_name': activity.project_name,
 
-                # FEEDBACK
-                'rating': (
-                    feedback_obj.rating if feedback_obj else None
-                ),
+                # ALL FEEDBACKS
+                'feedbacks': [
+                    {
+                        'rating': f.rating,
+                        'feedback': f.feedback,
+                        'created_at': f.created_at
+                    }
+                    for f in feedbacks
+                ],
 
-                'feedback': (
-                    feedback_obj.feedback if feedback_obj else None
-                ),
-
-                # TIMESTAMP
                 'created_at': activity.created_at,
                 'last_login_date': activity.created_at.strftime('%d/%m/%Y'),
             })
@@ -237,13 +237,26 @@ class WorkflowFeedbackView(APIView):
 
         # Validate rating
         try:
-            rating = int(request.data.get('rating', 0))
+            rating = float(request.data.get('rating', 0))
         except (TypeError, ValueError):
             rating = 0
 
-        if rating not in (1, 2, 3, 4, 5):
+        valid_ratings = (
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            2.5,
+            3.0,
+            3.5,
+            4.0,
+            4.5,
+            5.0,
+        )
+
+        if rating not in valid_ratings:
             return Response(
-                {'error': 'rating must be between 1 and 5'},
+                {'error': f'rating must be one of {valid_ratings}'},
                 status=400,
             )
 
