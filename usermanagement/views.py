@@ -1,5 +1,5 @@
 from django.shortcuts import render
-from .models import UserActivity, WorkflowFeedback as _WorkflowFeedback
+from .models import UserActivity, WorkflowFeedback as _WorkflowFeedback, ClientMaster
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from .permissions import IsAdminUser
@@ -13,6 +13,7 @@ from django.db.models.functions import (
 )
 from django.utils.dateparse import parse_date
 from django.db.models import Count
+from .serializers import ClientMasterSerializer
 
 class AdminTrackingPagination(PageNumberPagination):
     page_size = 20
@@ -652,4 +653,125 @@ class AdminAnalyticsView(APIView):
             'top_projects': top_projects,
 
             'top_users': top_users,
+        })
+        
+# Client name Add API
+
+class ClientMasterView(APIView):
+
+    def get_permissions(self):
+
+        # everyone can fetch dropdown
+        if self.request.method == "GET":
+            return [IsAuthenticated()]
+
+        # CRUD only admin
+        return [IsAuthenticated(), IsAdminUser()]
+
+    # =========================================
+    # GET ALL CLIENTS
+    # =========================================
+
+    def get(self, request):
+
+        clients = ClientMaster.objects.filter(
+            is_active=True
+        )
+
+        serializer = ClientMasterSerializer(
+            clients,
+            many=True
+        )
+
+        return Response({
+            "clients": serializer.data
+        })
+
+
+    # =========================================
+    # CREATE CLIENT
+    # =========================================
+
+    def post(self, request):
+
+        serializer = ClientMasterSerializer(
+            data=request.data
+        )
+
+        if serializer.is_valid():
+
+            serializer.save()
+
+            return Response({
+                "message":"Client created",
+                "data":serializer.data
+            })
+
+        return Response(
+            serializer.errors,
+            status=400
+        )
+
+
+    # =========================================
+    # UPDATE CLIENT
+    # =========================================
+
+    def put(self, request):
+
+        client_id = request.data.get("id")
+
+        client = ClientMaster.objects.filter(
+            id=client_id
+        ).first()
+
+        if not client:
+            return Response(
+                {"error":"Client not found"},
+                status=404
+            )
+
+        serializer = ClientMasterSerializer(
+            client,
+            data=request.data,
+            partial=True
+        )
+
+        if serializer.is_valid():
+
+            serializer.save()
+
+            return Response({
+                "message":"Updated",
+                "data":serializer.data
+            })
+
+        return Response(
+            serializer.errors,
+            status=400
+        )
+
+
+    # =========================================
+    # DELETE CLIENT
+    # =========================================
+
+    def delete(self, request):
+
+        client_id = request.GET.get("id")
+
+        client = ClientMaster.objects.filter(
+            id=client_id
+        ).first()
+
+        if not client:
+            return Response(
+                {"error":"Client not found"},
+                status=404
+            )
+
+        client.delete()
+
+        return Response({
+            "message":"Deleted successfully"
         })
