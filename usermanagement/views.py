@@ -1,5 +1,5 @@
 from django.shortcuts import render
-from .models import UserActivity, WorkflowFeedback as _WorkflowFeedback, ClientMaster
+from .models import UserActivity, WorkflowFeedback , ClientMaster
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from .permissions import IsAdminUser
@@ -40,13 +40,8 @@ class AdminPanelView(APIView):
         queryset = (
             UserActivity.objects
             .select_related('user')
-            .prefetch_related('feedbacks')
             .order_by('-created_at')
         )
-
-        # ========================================================
-        # SEARCH
-        # ========================================================
 
         search = request.GET.get('search')
 
@@ -60,13 +55,8 @@ class AdminPanelView(APIView):
                 Q(user__role__icontains=search) |
                 Q(workflow__icontains=search) |
                 Q(client_name__icontains=search) |
-                Q(project_name__icontains=search) |
-                Q(feedbacks__feedback__icontains=search)
+                Q(project_name__icontains=search)
             ).distinct()
-
-        # ========================================================
-        # FILTERS
-        # ========================================================
 
         workflow = request.GET.get('workflow')
         role = request.GET.get('role')
@@ -83,10 +73,6 @@ class AdminPanelView(APIView):
                 client_name__icontains=client_name
             )
 
-        # ========================================================
-        # PAGINATION
-        # ========================================================
-
         paginator = self.pagination_class()
 
         page = paginator.paginate_queryset(
@@ -98,33 +84,20 @@ class AdminPanelView(APIView):
 
         for activity in page:
 
-            feedbacks = activity.feedbacks.all()
-
             result.append({
                 'activity_id': activity.id,
 
-                # USER INFO
                 'username': activity.user.username,
                 'first_name': activity.user.first_name,
                 'last_name': activity.user.last_name,
                 'email': activity.user.email,
                 'role': activity.user.role,
 
-                # WORKFLOW INFO
                 'workflow': activity.get_workflow_display(),
                 'workflow_key': activity.workflow,
+
                 'client_name': activity.client_name,
                 'project_name': activity.project_name,
-
-                # ALL FEEDBACKS
-                'feedbacks': [
-                    {
-                        'rating': f.rating,
-                        'feedback': f.feedback,
-                        'created_at': f.created_at
-                    }
-                    for f in feedbacks
-                ],
 
                 'created_at': activity.created_at,
                 'last_login_date': activity.created_at.strftime('%d/%m/%Y'),
@@ -135,7 +108,7 @@ class AdminPanelView(APIView):
         })
 
     # ============================================================
-    # CREATE WORKFLOW ACTIVITY
+    # CREATE ACTIVITY
     # ============================================================
     def post(self, request):
 
@@ -151,7 +124,7 @@ class AdminPanelView(APIView):
                 status=400,
             )
 
-        activity = UserActivity.objects.create(
+        UserActivity.objects.create(
             user=user,
             workflow=workflow,
             project_name=request.data.get('project_name', ''),
@@ -159,28 +132,27 @@ class AdminPanelView(APIView):
         )
 
         return Response({
-            'activity_id': activity.id,
+            'status': 'success',
+            'message': 'Activity created successfully'
         })
   
 class WorkflowFeedbackView(APIView):
 
     def get_permissions(self):
 
-        # GET → admin only
         if self.request.method == 'GET':
             return [IsAuthenticated(), IsAdminUser()]
 
-        # POST → all authenticated users
         return [IsAuthenticated()]
 
     # ============================================================
-    # OPTIONAL ADMIN FEEDBACK VIEW
+    # ADMIN FEEDBACK VIEW
     # ============================================================
     def get(self, request):
 
         rows = (
-            _WorkflowFeedback.objects
-            .select_related('user', 'activity')
+            WorkflowFeedback.objects
+            .select_related('user')
             .order_by('-created_at')
         )
 
@@ -191,16 +163,16 @@ class WorkflowFeedbackView(APIView):
             result.append({
                 'id': row.id,
 
+                # User Information
                 'username': row.user.username,
+                'first_name': row.user.first_name,
+                'last_name': row.user.last_name,
+                'email': row.user.email,
+                'role': row.user.role,
+
+                # Feedback Information
                 'workflow': row.get_workflow_display(),
-
-                'client_name': (
-                    row.activity.client_name if row.activity else None
-                ),
-
-                'project_name': (
-                    row.activity.project_name if row.activity else None
-                ),
+                'workflow_key': row.workflow,
 
                 'rating': row.rating,
                 'feedback': row.feedback,
@@ -211,28 +183,26 @@ class WorkflowFeedbackView(APIView):
         return Response({'feedbacks': result})
 
     # ============================================================
-    # SUBMIT FEEDBACK
+    # SUBMIT / UPDATE FEEDBACK
     # ============================================================
     def post(self, request):
 
         user = request.user
 
-        activity_id = request.data.get('activity_id')
+        workflow = request.data.get('workflow', '').strip()
 
-        if not activity_id:
+        valid_workflows = [
+            c[0] for c in WorkflowFeedback.WORKFLOW_CHOICES
+        ]
+
+        if workflow not in valid_workflows:
             return Response(
-                {'error': 'activity_id is required'},
-                status=400,
-            )
-
-        activity = UserActivity.objects.filter(
-            id=activity_id,
-            user=user
-        ).first()
-
-        if not activity:
-            return Response(
-                {'error': 'Invalid activity_id'},
+                {
+                    'error': (
+                        f'workflow must be one of: '
+                        f'{valid_workflows}'
+                    )
+                },
                 status=400,
             )
 
@@ -257,23 +227,34 @@ class WorkflowFeedbackView(APIView):
 
         if rating not in valid_ratings:
             return Response(
-                {'error': f'rating must be one of {valid_ratings}'},
+                {
+                    'error': (
+                        f'rating must be one of '
+                        f'{valid_ratings}'
+                    )
+                },
                 status=400,
             )
 
-        obj = _WorkflowFeedback.objects.create(
+        feedback_text = request.data.get(
+            'feedback',
+            ''
+        ).strip()
+
+        obj, created = WorkflowFeedback.objects.update_or_create(
             user=user,
-            activity=activity,
-
-            # workflow auto from activity
-            workflow=activity.workflow,
-
-            rating=rating,
-            feedback=request.data.get('feedback', '').strip(),
+            workflow=workflow,
+            defaults={
+                'rating': rating,
+                'feedback': feedback_text,
+            }
         )
 
         return Response({
-            'status': 'submitted',
+            'status': 'updated' if not created else 'submitted',
+            'workflow': workflow,
+            'rating': rating,
+            'feedback': feedback_text,
         })
         
 class AdminAnalyticsView(APIView):

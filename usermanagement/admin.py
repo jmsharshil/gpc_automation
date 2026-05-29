@@ -1,13 +1,9 @@
 from django.contrib import admin
-from .models import (
-    UserActivity,
-    WorkflowFeedback
-)
+from .models import UserActivity, WorkflowFeedback, ClientMaster
 
-# Register your models here.
+
 @admin.register(UserActivity)
 class UserActivityAdmin(admin.ModelAdmin):
-
     list_display = (
         'id',
         'user',
@@ -29,23 +25,49 @@ class UserActivityAdmin(admin.ModelAdmin):
         'project_name',
     )
 
+    readonly_fields = (
+        'created_at',
+    )
+
     ordering = ('-created_at',)
 
+    date_hierarchy = 'created_at'
 
-# ============================================================
-# WORKFLOW FEEDBACK ADMIN
-# ============================================================
+    list_per_page = 25
+
+    fieldsets = (
+        ('User Information', {
+            'fields': (
+                'user',
+                'workflow',
+            )
+        }),
+        ('Project Details', {
+            'fields': (
+                'client_name',
+                'project_name',
+            )
+        }),
+        ('Additional Details', {
+            'fields': (
+                'details',
+            )
+        }),
+        ('Timestamps', {
+            'fields': (
+                'created_at',
+            )
+        }),
+    )
+
 
 @admin.register(WorkflowFeedback)
 class WorkflowFeedbackAdmin(admin.ModelAdmin):
-
     list_display = (
         'id',
         'user',
         'workflow',
         'rating',
-        'client_name',
-        'project_name',
         'created_at',
     )
 
@@ -59,18 +81,83 @@ class WorkflowFeedbackAdmin(admin.ModelAdmin):
         'user__username',
         'user__email',
         'feedback',
-        'activity__client_name',
-        'activity__project_name',
+    )
+
+    readonly_fields = (
+        'created_at',
     )
 
     ordering = ('-created_at',)
 
-    def client_name(self, obj):
-        return obj.activity.client_name if obj.activity else '-'
+    date_hierarchy = 'created_at'
 
-    client_name.short_description = 'Client Name'
+    list_per_page = 25
 
-    def project_name(self, obj):
-        return obj.activity.project_name if obj.activity else '-'
+    fieldsets = (
+        ('Feedback Information', {
+            'fields': (
+                'user',
+                'workflow',
+                'rating',
+            )
+        }),
+        ('User Feedback', {
+            'fields': (
+                'feedback',
+            )
+        }),
+        ('Timestamp', {
+            'fields': (
+                'created_at',
+            )
+        }),
+    )
 
-    project_name.short_description = 'Project Name'
+
+@admin.register(ClientMaster)
+class ClientMasterAdmin(admin.ModelAdmin):
+    list_display = (
+        'id',
+        'name',
+        'is_active',
+        'created_at',
+        'updated_at',
+    )
+
+    list_filter = (
+        'is_active',
+        'created_at',
+        'updated_at',
+    )
+
+    search_fields = (
+        'name',
+    )
+
+    readonly_fields = (
+        'created_at',
+        'updated_at',
+    )
+
+    ordering = ('name',)
+
+    list_editable = (
+        'is_active',
+    )
+
+    list_per_page = 25
+
+    fieldsets = (
+        ('Client Information', {
+            'fields': (
+                'name',
+                'is_active',
+            )
+        }),
+        ('Timestamps', {
+            'fields': (
+                'created_at',
+                'updated_at',
+            )
+        }),
+    )
