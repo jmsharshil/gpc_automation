@@ -12,7 +12,7 @@ from django.db.models.functions import (
     TruncMonth,
 )
 from django.utils.dateparse import parse_date
-from django.db.models import Count
+from django.db.models import Count, Avg
 from .serializers import ClientMasterSerializer
 
 class AdminTrackingPagination(PageNumberPagination):
@@ -280,8 +280,21 @@ class AdminAnalyticsView(APIView):
         project_name = request.GET.get('project_name')
         username = request.GET.get('username')
 
+        # =====================================================
+        # ACTIVITY QUERYSET
+        # =====================================================
+
         queryset = (
             UserActivity.objects
+            .select_related('user')
+        )
+
+        # =====================================================
+        # FEEDBACK QUERYSET
+        # =====================================================
+
+        feedback_queryset = (
+            WorkflowFeedback.objects
             .select_related('user')
         )
 
@@ -298,27 +311,46 @@ class AdminAnalyticsView(APIView):
                 ]
             )
 
+            feedback_queryset = feedback_queryset.filter(
+                created_at__date__range=[
+                    parse_date(start_date),
+                    parse_date(end_date),
+                ]
+            )
+
         # =====================================================
         # OPTIONAL FILTERS
         # =====================================================
 
         if workflow:
+
             queryset = queryset.filter(
                 workflow=workflow
             )
 
+            feedback_queryset = feedback_queryset.filter(
+                workflow=workflow
+            )
+
         if client_name:
+
             queryset = queryset.filter(
                 client_name__icontains=client_name
             )
 
         if project_name:
+
             queryset = queryset.filter(
                 project_name__icontains=project_name
             )
 
         if username:
+
             queryset = queryset.filter(
+                user__username__icontains=username
+            )
+
+            feedback_queryset = feedback_queryset.filter(
                 user__username__icontains=username
             )
 
@@ -423,6 +455,7 @@ class AdminAnalyticsView(APIView):
             .values(
                 'user__username',
                 'user__email',
+                'user__role'
             )
             .annotate(
                 count=Count('id')
@@ -431,55 +464,87 @@ class AdminAnalyticsView(APIView):
         )
 
         # =====================================================
-        # CLIENT + PROJECT COUNTS
+        # CLIENT ANALYTICS
         # =====================================================
 
-        client_project_counts = (
+        clients = (
             queryset
             .exclude(client_name='')
-            .exclude(project_name='')
-            .values(
-                'client_name',
-                'project_name',
-            )
+            .values('client_name')
             .annotate(
-                count=Count('id')
+                total_runs=Count('id'),
+                unique_projects=Count(
+                    'project_name',
+                    distinct=True
+                ),
+                unique_users=Count(
+                    'user',
+                    distinct=True
+                )
             )
-            .order_by('-count')
+            .order_by('-total_runs')
         )
 
         # =====================================================
-        # CLIENT + WORKFLOW COUNTS
+        # FEEDBACK SUMMARY
         # =====================================================
 
-        client_workflow_counts = (
-            queryset
-            .exclude(client_name='')
-            .values(
-                'client_name',
-                'workflow',
+        feedback_summary = {
+
+            'total_feedbacks': (
+                feedback_queryset.count()
+            ),
+
+            'average_rating': (
+                feedback_queryset.aggregate(
+                    avg=Avg('rating')
+                )['avg'] or 0
             )
+        }
+
+        # =====================================================
+        # RATING DISTRIBUTION
+        # =====================================================
+
+        rating_distribution = (
+            feedback_queryset
+            .values('rating')
             .annotate(
                 count=Count('id')
             )
-            .order_by('-count')
+            .order_by('rating')
         )
 
         # =====================================================
-        # PROJECT + WORKFLOW COUNTS
+        # WORKFLOW FEEDBACK ANALYTICS
         # =====================================================
 
-        project_workflow_counts = (
-            queryset
-            .exclude(project_name='')
+        workflow_feedbacks = (
+            feedback_queryset
+            .values('workflow')
+            .annotate(
+                total_feedbacks=Count('id'),
+                average_rating=Avg('rating')
+            )
+            .order_by('-average_rating')
+        )
+
+        # =====================================================
+        # USER FEEDBACK ANALYTICS
+        # =====================================================
+
+        user_feedbacks = (
+            feedback_queryset
             .values(
-                'project_name',
-                'workflow',
+                'user__username',
+                'user__email',
+                'user__role'
             )
             .annotate(
-                count=Count('id')
+                total_feedbacks=Count('id'),
+                average_rating=Avg('rating')
             )
-            .order_by('-count')
+            .order_by('-average_rating')
         )
 
         # =====================================================
@@ -505,7 +570,7 @@ class AdminAnalyticsView(APIView):
             .annotate(date=trunc)
             .values(
                 'date',
-                'workflow',
+                'workflow'
             )
             .annotate(
                 total_runs=Count('id')
@@ -523,7 +588,7 @@ class AdminAnalyticsView(APIView):
             .annotate(date=trunc)
             .values(
                 'date',
-                'client_name',
+                'client_name'
             )
             .annotate(
                 total_runs=Count('id')
@@ -541,7 +606,7 @@ class AdminAnalyticsView(APIView):
             .annotate(date=trunc)
             .values(
                 'date',
-                'project_name',
+                'project_name'
             )
             .annotate(
                 total_runs=Count('id')
@@ -550,90 +615,34 @@ class AdminAnalyticsView(APIView):
         )
 
         # =====================================================
-        # TOP CLIENTS
-        # =====================================================
-
-        top_clients = client_counts[:10]
-
-        # =====================================================
-        # TOP PROJECTS
-        # =====================================================
-
-        top_projects = project_counts[:10]
-
-        # =====================================================
-        # TOP USERS
-        # =====================================================
-
-        top_users = user_counts[:10]
-
-        # =====================================================
         # RESPONSE
         # =====================================================
 
         return Response({
 
-            # =================================================
-            # SUMMARY
-            # =================================================
-
+            # Activity Summary
             'summary': summary,
 
-            # =================================================
-            # COUNTS
-            # =================================================
-
+            # Activity Analytics
             'workflow_counts': workflow_counts,
-
             'client_counts': client_counts,
-
             'project_counts': project_counts,
-
             'user_counts': user_counts,
 
-            # =================================================
-            # RELATIONAL ANALYTICS
-            # =================================================
+            # Client Analytics
+            'clients': clients,
 
-            'client_project_counts': (
-                client_project_counts
-            ),
+            # Feedback Analytics
+            'feedback_summary': feedback_summary,
+            'rating_distribution': rating_distribution,
+            'workflow_feedbacks': workflow_feedbacks,
+            'user_feedbacks': user_feedbacks,
 
-            'client_workflow_counts': (
-                client_workflow_counts
-            ),
-
-            'project_workflow_counts': (
-                project_workflow_counts
-            ),
-
-            # =================================================
-            # TIMELINES
-            # =================================================
-
+            # Timelines
             'timeline': timeline,
-
-            'workflow_timeline': (
-                workflow_timeline
-            ),
-
-            'client_timeline': (
-                client_timeline
-            ),
-
-            'project_timeline': (
-                project_timeline
-            ),
-
-            # =================================================
-            # TOP DATA
-            # =================================================
-
-            'top_clients': top_clients,
-
-            'top_projects': top_projects,
-
-            'top_users': top_users,
+            'workflow_timeline': workflow_timeline,
+            'client_timeline': client_timeline,
+            'project_timeline': project_timeline,
         })
         
 # Client name Add API
