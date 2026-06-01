@@ -12,6 +12,9 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework.views import APIView
+from .serializers import UserListSerializer, ChangeUserRoleSerializer
+from rest_framework.permissions import IsAuthenticated
 
 User = get_user_model()
 
@@ -599,3 +602,75 @@ def microsoft_callback_json(request):
             'error': 'Failed to authenticate with Microsoft',
             'details': str(e)
         }, status=status.HTTP_400_BAD_REQUEST)
+        
+class UserListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """
+        Get all users
+        """
+
+        # Optional: Only admins can access
+        if request.user.role != 'admin':
+            return Response(
+                {"error": "Only admins can access this endpoint."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        users = User.objects.all().order_by('-date_joined')
+
+        serializer = UserListSerializer(users, many=True)
+
+        return Response({
+            "count": users.count(),
+            "users": serializer.data
+        })
+
+
+class ChangeUserRoleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, user_id):
+        """
+        Change role of user
+        """
+
+        # Optional: Only admins can change roles
+        if request.user.role != 'admin':
+            return Response(
+                {"error": "Only admins can change user roles."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {"error": "User not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = ChangeUserRoleSerializer(data=request.data)
+
+        if serializer.is_valid():
+
+            new_role = serializer.validated_data['role']
+
+            user.role = new_role
+            user.save()
+
+            return Response({
+                "message": f"User role updated to {new_role}",
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "role": user.role
+                }
+            })
+
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
