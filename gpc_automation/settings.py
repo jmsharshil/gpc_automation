@@ -52,7 +52,8 @@ INSTALLED_APPS = [
     'transactions',
     'audit',
     'articleai',
-    'usermanagement'
+    'usermanagement',
+    'ask_valuation',
 ]
 
 REST_FRAMEWORK = {

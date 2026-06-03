@@ -28,6 +28,8 @@ urlpatterns = [
     path('api/v1/audit/', include("audit.urls")),
     path('api/v1/article/', include("articleai.urls")),
     path('api/v1/user/', include("usermanagement.urls")),
+    path('api/v1/ask-valuation/', include("ask_valuation.urls")),
+    
     
 ]
 if settings.DEBUG and not settings.USE_AZURE_MEDIA:
