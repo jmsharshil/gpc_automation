@@ -3,9 +3,9 @@ from .models import Guide, GuideChunk, ValuationSession, ValuationMessage
 
 @admin.register(Guide)
 class GuideAdmin(admin.ModelAdmin):
-    list_display = ['name', 'is_active', 'total_pages', 'total_chunks', 'processing_status', 'created_at']
+    list_display = ['name', 'is_active', 'total_pages', 'year','total_chunks', 'processing_status', 'created_at']
     list_filter = ['is_active', 'processing_status']
-    search_fields = ['name', 'description']
+    search_fields = ['name', 'year']
     readonly_fields = ['total_pages', 'total_chunks', 'processing_status', 'processing_error', 'created_at', 'updated_at']
     ordering = ['name']
 

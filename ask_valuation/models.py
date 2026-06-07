@@ -16,7 +16,7 @@ class Guide(models.Model):
     """A single valuation-guideline PDF uploaded by an admin."""
 
     name = models.CharField(max_length=255, unique=True)
-    description = models.TextField(blank=True)
+    year = models.TextField(blank=True)
     pdf_file = models.FileField(upload_to='ask_valuation/guides/')
     is_active = models.BooleanField(default=True)
     total_pages = models.IntegerField(default=0)

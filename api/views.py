@@ -389,7 +389,7 @@ def _sentence_matches_phrase(description: str, words: list[str]) -> bool:
 def _stem_prefilter_q_for_words(field, words):
     """
     Build a Q that matches rows where each word (by stem) appears somewhere.
-    For each word we create a regex like r'\b<stem>\w*\b' so 'management' -> stem 'manag' matches 'manage','management','managing'.
+    For each word we create a regex like r'<stem>\w*' so 'management' -> stem 'manag' matches 'manage','management','managing'.
     For multiple words we AND the per-word Qs.
     """
     db_engine = (connection.settings_dict.get('ENGINE', '') or '').lower()

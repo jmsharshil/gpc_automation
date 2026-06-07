@@ -7,7 +7,7 @@ class GuideSerializer(serializers.ModelSerializer):
     class Meta:
         model = Guide
         fields = [
-            'id', 'name', 'description', 'pdf_file', 'pdf_url',
+            'id', 'name', 'year', 'pdf_file', 'pdf_url',
             'is_active', 'total_pages', 'total_chunks',
             'processing_status', 'processing_error',
             'created_at', 'updated_at',
@@ -34,7 +34,7 @@ class GuideListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Guide
-        fields = ['id', 'name', 'description', 'is_active', 'total_pages', 'processing_status']
+        fields = ['id', 'name', 'year', 'is_active', 'total_pages', 'processing_status']
 
 class ValuationMessageSerializer(serializers.ModelSerializer):
     sources = serializers.SerializerMethodField()
