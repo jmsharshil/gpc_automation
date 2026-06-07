@@ -1402,149 +1402,234 @@ class EditAndResendAPIView(APIView):
 
     def patch(self, request, chat_pk, message_pk):
         user = request.user
-        chat = get_object_or_404(Chat, pk=chat_pk, owner=user)
 
-        new_content = (request.data.get('content') or request.GET.get('content') or '').strip()
+        chat = get_object_or_404(
+            Chat,
+            pk=chat_pk,
+            owner=user
+        )
+
+        new_content = (
+            request.data.get("content")
+            or request.GET.get("content")
+            or ""
+        ).strip()
+
         if not new_content:
-            return Response({'error': 'content is required'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "content is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            msg = Message.objects.get(pk=message_pk, chat=chat)
-        except Message.DoesNotExist:
-            return Response({'detail': 'No Message matches the given query.'}, status=status.HTTP_404_NOT_FOUND)
-
-        if msg.role == 'assistant':
-            user_msg = chat.messages.filter(role='user', created_at__lt=msg.created_at).order_by('-created_at').first()
-            if not user_msg:
-                return Response({'detail': 'No preceding user message found.'}, status=status.HTTP_404_NOT_FOUND)
-            msg = user_msg
-        elif msg.role != 'user':
-            return Response({'detail': 'Message must be a user message.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        original_content = msg.content or ''
-        with transaction.atomic():
-            meta = msg.metadata or {}
-            meta.setdefault('edits', []).append({
-                'original': original_content,
-                'edited_at': timezone.now().isoformat(),
-                'editor_id': user.id,
-            })
-            msg.content = new_content
-            msg.metadata = meta
-            msg.edited = True
-            msg.edited_at = timezone.now()
-            msg.save()
-
-            # Rebuild payload
-            system_prompt = chat.system_prompt or ''
-            messages_payload = []
-            if system_prompt:
-                messages_payload.append({'role': 'system', 'content': system_prompt})
-
-            recent_messages = chat.messages.all().order_by('-created_at')[:20][::-1]
-            for m in recent_messages:
-                content = m.content or ''
-                if m.attachment:
-                    att_note = f"[Attachment: {m.attachment_name} | content-type: {m.attachment_content_type}]"
-                    messages_payload.append({'role': m.role, 'content': (content + "\n\n" + att_note).strip()})
-                else:
-                    messages_payload.append({'role': m.role, 'content': content})
-
-            # Model & params
-            user_setting = getattr(user, 'openai_setting', None)
-            model = (
-                request.data.get('model') or
-                (user_setting.default_model if user_setting else None) or
-                "gpt-5"
+            msg = Message.objects.get(
+                pk=message_pk,
+                chat=chat
             )
-            max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 8000))
-            temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
+        except Message.DoesNotExist:
+            return Response(
+                {"detail": "Message not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
-            logger.debug("Edit call → model=%s temp=%s max=%s", model, temperature, max_tokens)
+        # If assistant message supplied, find preceding user message
+        if msg.role == "assistant":
+            user_msg = (
+                chat.messages.filter(
+                    role="user",
+                    created_at__lt=msg.created_at
+                )
+                .order_by("-created_at")
+                .first()
+            )
 
-            try:
-                from openai import OpenAI
-                client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
+            if not user_msg:
+                return Response(
+                    {"detail": "No preceding user message found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
 
-                def event_stream():
-                    full_text = ""
-                    usage_data = {}
+            msg = user_msg
 
-                    with client.responses.stream(
+        elif msg.role != "user":
+            return Response(
+                {"detail": "Message must be a user message."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+
+            with transaction.atomic():
+
+                # Save edit history
+                metadata = msg.metadata or {}
+
+                metadata.setdefault("edits", []).append({
+                    "original": msg.content,
+                    "edited_at": timezone.now().isoformat(),
+                    "editor_id": user.id,
+                })
+
+                msg.content = new_content
+                msg.metadata = metadata
+                msg.edited = True
+                msg.edited_at = timezone.now()
+                msg.save()
+
+                # ==================================================
+                # IMPORTANT:
+                # Delete everything after edited message
+                # ==================================================
+                Message.objects.filter(
+                    chat=chat,
+                    created_at__gt=msg.created_at
+                ).delete()
+
+            # ==================================================
+            # Build payload only up to edited message
+            # ==================================================
+            system_prompt = chat.system_prompt or ""
+
+            messages_payload = []
+
+            if system_prompt:
+                messages_payload.append({
+                    "role": "system",
+                    "content": system_prompt
+                })
+
+            conversation_messages = (
+                chat.messages
+                .filter(created_at__lte=msg.created_at)
+                .order_by("created_at")
+            )
+
+            for m in conversation_messages:
+                content = m.content or ""
+
+                if m.attachment:
+                    attachment_note = (
+                        f"[Attachment: {m.attachment_name} | "
+                        f"content-type: {m.attachment_content_type}]"
+                    )
+
+                    content = (
+                        f"{content}\n\n{attachment_note}"
+                    ).strip()
+
+                messages_payload.append({
+                    "role": m.role,
+                    "content": content
+                })
+
+            user_setting = getattr(user, "openai_setting", None)
+
+            model = (
+                request.data.get("model")
+                or getattr(user_setting, "default_model", None)
+                or "gpt-4o"
+            )
+
+            max_tokens = int(
+                request.data.get("max_tokens")
+                or getattr(user_setting, "max_tokens", 2000)
+            )
+
+            temperature = float(
+                request.data.get("temperature")
+                or getattr(user_setting, "temperature", 0.7)
+            )
+
+            logger.info(
+                "Edit & Resend -> chat=%s model=%s",
+                chat.id,
+                model
+            )
+
+            client = OpenAI(
+                api_key=getattr(
+                    settings,
+                    "OPENAI_API_KEY",
+                    None
+                )
+            )
+
+            def event_stream():
+                full_text = []
+
+                try:
+
+                    with client.chat.completions.create(
                         model=model,
-                        input=messages_payload,
-                        instructions=system_prompt or None,
-                        tools=[{"type": "web_search"}],
+                        messages=messages_payload,
                         temperature=temperature,
-                        max_output_tokens=max_tokens,
+                        max_tokens=max_tokens,
+                        stream=True,
                     ) as stream:
 
-                        for event in stream:
-                            if event.type == "response.output_text.delta":
-                                delta = event.delta
-                                full_text += delta
-                                yield delta
+                        for chunk in stream:
 
-                            elif event.type == "response.completed":
-                                response = stream.get_final_response()
-                                if hasattr(response, "usage") and response.usage:
-                                    usage_data = (
-                                        response.usage.model_dump()
-                                        if hasattr(response.usage, "model_dump")
-                                        else {}
-                                    )
+                            delta = (
+                                chunk.choices[0].delta
+                                if chunk.choices
+                                else None
+                            )
 
-                    # ✅ Save after stream completes
+                            if delta and delta.content:
+                                text_piece = delta.content
+
+                                full_text.append(text_piece)
+
+                                escaped = text_piece.replace(
+                                    "\n",
+                                    "\\n"
+                                )
+
+                                yield f"data: {escaped}\n\n"
+
+                    assistant_text = "".join(full_text)
+
                     Message.objects.create(
                         chat=chat,
-                        role='assistant',
-                        content=full_text,
+                        role="assistant",
+                        content=assistant_text,
                         metadata={
-                            "openai_usage": usage_data,
-                            "replaced_by_edit_of": msg.pk
+                            "streaming": True,
+                            "edited_from_message": msg.pk
                         }
                     )
 
-                    # After stream ends → save full assistant message
-                    assistant_msg = Message.objects.create(
-                        chat=chat,
-                        role='assistant',
-                        content=full_text,
+                except Exception as e:
+                    logger.exception(
+                        "Edit & resend streaming failed: %s",
+                        e
                     )
 
-                return StreamingHttpResponse(
-                    event_stream(),
-                    content_type="text/plain"
-                )
+                    yield f"data: [ERROR] {str(e)}\n\n"
 
-            except Exception as e:
-                logger.exception("OpenAI streaming failed: %s", e)
-                return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
-                usage = resp.usage.model_dump() if hasattr(resp.usage, 'model_dump') else {}
+                finally:
+                    yield "data: [DONE]\n\n"
 
-                assistant_msg = chat.messages.filter(role='assistant', created_at__gt=msg.created_at).order_by('created_at').first()
-                if assistant_msg:
-                    assistant_msg.content = assistant_text
-                    meta = assistant_msg.metadata or {}
-                    meta['openai_usage'] = usage
-                    meta['replaced_by_edit_of'] = msg.pk
-                    assistant_msg.metadata = meta
-                    assistant_msg.updated_at = timezone.now()
-                    assistant_msg.save()
-                else:
-                    assistant_msg = Message.objects.create(
-                        chat=chat,
-                        role='assistant',
-                        content=assistant_text,
-                        metadata={'openai_usage': usage, 'replaced_by_edit_of': msg.pk}
-                    )
+            response = StreamingHttpResponse(
+                event_stream(),
+                content_type="text/event-stream"
+            )
 
-                serializer = MessageSerializer(assistant_msg, context={'request': request})
-                return Response(serializer.data, status=status.HTTP_200_OK)
+            response["Cache-Control"] = "no-cache"
+            response["X-Accel-Buffering"] = "no"
 
-            except Exception as e:
-                logger.exception("OpenAI edit call failed: %s", e)
-                return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+            return response
+
+        except Exception as e:
+            logger.exception(
+                "Edit and resend failed: %s",
+                e
+            )
+
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 class ChatNameListAPIView(generics.ListAPIView):
     serializer_class = ChatNameSerializer
@@ -1554,3 +1639,27 @@ class ChatNameListAPIView(generics.ListAPIView):
         return Chat.objects.filter(
             owner=self.request.user
         ).order_by('-updated_at').only('id', 'title', 'created_at', 'updated_at')
+        
+class ClearChatSessionAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_pk):
+        chat = get_object_or_404(
+            Chat,
+            pk=chat_pk,
+            owner=request.user
+        )
+
+        deleted_count, _ = Message.objects.filter(
+            chat=chat
+        ).delete()
+
+        # Optional: clear document chunks too
+        chat.has_document = False
+        chat.save(update_fields=['has_document'])
+
+        return Response({
+            "success": True,
+            "message": "Chat history cleared successfully.",
+            "deleted_messages": deleted_count
+        }, status=status.HTTP_200_OK)
