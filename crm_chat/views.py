@@ -1663,3 +1663,37 @@ class ClearChatSessionAPIView(APIView):
             "message": "Chat history cleared successfully.",
             "deleted_messages": deleted_count
         }, status=status.HTTP_200_OK)
+
+class UpdateGlobalOpenAISettingsAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+    
+        default_model = request.data.get("default_model")
+        temperature = request.data.get("temperature")
+        max_tokens = request.data.get("max_tokens")
+
+        update_fields = {}
+
+        if default_model is not None:
+            update_fields["default_model"] = default_model
+
+        if temperature is not None:
+            update_fields["temperature"] = temperature
+
+        if max_tokens is not None:
+            update_fields["max_tokens"] = max_tokens
+
+        if not update_fields:
+            return Response(
+                {"detail": "No fields provided."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        updated_count = UserOpenAISetting.objects.update(**update_fields)
+
+        return Response({
+            "message": "Global settings updated successfully.",
+            "updated_users": updated_count,
+            "settings": update_fields
+        })
