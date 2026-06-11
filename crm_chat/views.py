@@ -970,7 +970,7 @@ class SendMessageAPIView(APIView):
         attachment_name = getattr(attachment, 'name', '') if attachment else ''
         attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
  
-        allowed_ext = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
+        allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png','.webp')
  
         # logger.info(
         #     "SendMessageAPIView received request chat_id=%s user_id=%s has_attachment=%s "
@@ -1230,7 +1230,7 @@ class StreamingChatAPIView(APIView):
  
         attachment_name = getattr(attachment, 'name', '') if attachment else ''
         attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
-        allowed_ext = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
+        allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png','.webp')
  
         # --- Handle file upload for RAG (non-streaming path) ---
         if attachment_name.lower().endswith(allowed_ext):

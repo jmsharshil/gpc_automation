@@ -322,6 +322,10 @@ import fitz
 from PIL import Image
 from openai import OpenAI
 from django.conf import settings
+from io import BytesIO
+from docx import Document
+from pptx import Presentation
+import pandas as pd
  
 logger = logging.getLogger(__name__)
  
@@ -506,6 +510,78 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> dict[int, str]:
     """Sync wrapper — for any caller that can't use async."""
     return asyncio.run(extract_text_from_pdf_async(pdf_bytes))
  
+async def extract_text_from_docx_async(file_bytes: bytes):
+    doc = Document(BytesIO(file_bytes))
+    
+    pages = {}
+    text_parts = []
+
+    for para in doc.paragraphs:
+        if para.text.strip():
+            text_parts.append(para.text)
+
+    pages[1] = "\n".join(text_parts)
+
+    return pages
+
+async def extract_text_from_excel_async(file_bytes: bytes):
+    excel_file = pd.ExcelFile(BytesIO(file_bytes))
+
+    pages = {}
+
+    for idx, sheet_name in enumerate(excel_file.sheet_names, start=1):
+
+        df = pd.read_excel(
+            excel_file,
+            sheet_name=sheet_name,
+            dtype=str
+        ).fillna("")
+
+        pages[idx] = (
+            f"Sheet: {sheet_name}\n\n"
+            + df.to_string(index=False)
+        )
+
+    return pages
+
+async def extract_text_from_ppt_async(file_bytes: bytes):
+    prs = Presentation(BytesIO(file_bytes))
+
+    pages = {}
+
+    for slide_no, slide in enumerate(prs.slides, start=1):
+
+        slide_text = []
+
+        for shape in slide.shapes:
+
+            if hasattr(shape, "text"):
+                txt = shape.text.strip()
+
+                if txt:
+                    slide_text.append(txt)
+
+        pages[slide_no] = "\n".join(slide_text)
+
+    return pages
+
+async def extract_text_from_csv_async(file_bytes: bytes):
+    df = pd.read_csv(
+        BytesIO(file_bytes),
+        dtype=str
+    ).fillna("")
+
+    return {
+        1: df.to_string(index=False)
+    }
+    
+async def extract_text_from_txt_async(file_bytes: bytes):
+    return {
+        1: file_bytes.decode(
+            "utf-8",
+            errors="ignore"
+        )
+    }
  
 # =====================================================
 # UPLOADED FILE ENTRY POINT  (PDF or image)
@@ -522,6 +598,21 @@ async def extract_text_from_uploaded_file_async(
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(None, vision_ocr_image, file_bytes)
         return {1: text}
+    elif lower.endswith(".docx"):
+        return await extract_text_from_docx_async(file_bytes)
+
+    elif lower.endswith((".xlsx", ".xls")):
+        return await extract_text_from_excel_async(file_bytes)
+
+    elif lower.endswith((".pptx", ".ppt")):
+        return await extract_text_from_ppt_async(file_bytes)
+
+    elif lower.endswith(".csv"):
+        return await extract_text_from_csv_async(file_bytes)
+
+    elif lower.endswith(".txt"):
+        return await extract_text_from_txt_async(file_bytes)
+
     return {1: ""}
  
  
