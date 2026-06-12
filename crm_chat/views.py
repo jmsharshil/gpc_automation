@@ -810,7 +810,6 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
         #     chat.id,
         #     len(chunk_objects),
         # )
-        await sync_to_async(DocumentChunk.objects.filter(chat=chat).delete)()
         await sync_to_async(DocumentChunk.objects.bulk_create)(chunk_objects, batch_size=100)
         # logger.info(
         #     "Saved document chunks for chat_id=%s saved_count=%s",
@@ -966,9 +965,13 @@ class SendMessageAPIView(APIView):
         user = resolve_request_user(request, chat=chat)
  
         user_text = request.data.get('content', '').strip()
-        attachment = request.FILES.get('attachment')
-        attachment_name = getattr(attachment, 'name', '') if attachment else ''
-        attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
+        attachments = request.FILES.getlist('attachment')
+
+        first_attachment = attachments[0] if attachments else None
+
+        attachment_name = (getattr(first_attachment, 'name', '') if first_attachment else '')
+
+        attachment_content_type = (getattr(first_attachment, 'content_type', '') if first_attachment else '')
  
         allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png','.webp')
  
@@ -979,69 +982,99 @@ class SendMessageAPIView(APIView):
         #     attachment_content_type, len(user_text), chat.has_document,
         # )
  
-        if not user_text and not attachment:
+        if not user_text and not attachments:
             return Response(
                 {'error': 'content or attachment is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
  
         # --- Handle file upload for RAG ---
-        if attachment_name.lower().endswith(allowed_ext):
-            file_bytes = attachment.read()
-            # logger.info(
-            #     "Read uploaded file bytes for chat_id=%s attachment_name=%s byte_count=%s",
-            #     chat.id, attachment_name, len(file_bytes),
-            # )
- 
-            # Save user message
-            user_msg = Message.objects.create(
-                chat=chat,
-                role='user',
-                content=user_text if user_text else f"[Uploaded file: {attachment_name}]",
-                attachment=attachment,
-                attachment_name=attachment_name,
-                attachment_content_type=attachment_content_type,
-            )
-            # logger.info(
-            #     "Created user message for chat_id=%s message_id=%s content=%s",
-            #     chat.id, user_msg.id, user_msg.content[:80],
-            # )
- 
-            # Process file in isolated thread (fixes Windows IocpProactor conflict)
+        if attachments:
+
+            processed_files = []
+            total_chunks = 0
+
             try:
-                # logger.info("Starting PDF processing for chat_id=%s", chat.id)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        _run_pdf_processing, chat, file_bytes, attachment_name
+
+                # Remove old chunks once
+                DocumentChunk.objects.filter(chat=chat).delete()
+
+                for attachment in attachments:
+
+                    attachment_name = attachment.name
+                    attachment_content_type = attachment.content_type
+
+                    if not attachment_name.lower().endswith(allowed_ext):
+                        continue
+
+                    file_bytes = attachment.read()
+
+                    Message.objects.create(
+                        chat=chat,
+                        role='user',
+                        content=f"[Uploaded file: {attachment_name}]",
+                        attachment=attachment,
+                        attachment_name=attachment_name,
+                        attachment_content_type=attachment_content_type,
                     )
-                    num_chunks = future.result()
- 
-                # logger.info(
-                #     "PDF processing completed for chat_id=%s chunk_count=%s",
-                #     chat.id, num_chunks,
-                # )
- 
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(
+                            _run_pdf_processing,
+                            chat,
+                            file_bytes,
+                            attachment_name
+                        )
+
+                        num_chunks = future.result()
+
+                    total_chunks += num_chunks
+                    processed_files.append(attachment_name)
+
                 if not user_text:
+
                     completion_msg = Message.objects.create(
                         chat=chat,
                         role='assistant',
-                        content=f'✅ File "{attachment_name}" processed ({num_chunks} chunks). You can now ask questions about it.',
+                        content=(
+                            f'✅ {len(processed_files)} file(s) processed '
+                            f'({total_chunks} chunks).\n\n'
+                            + "\n".join(processed_files)
+                        ),
                     )
-                    serializer = MessageSerializer(completion_msg, context={'request': request})
-                    return Response(serializer.data, status=status.HTTP_201_CREATED)
- 
+
+                    serializer = MessageSerializer(
+                        completion_msg,
+                        context={'request': request}
+                    )
+
+                    return Response(
+                        serializer.data,
+                        status=status.HTTP_201_CREATED
+                    )
+
             except Exception as e:
+
                 logger.exception(
-                    "File upload processing failed for chat_id=%s attachment_name=%s: %s",
-                    chat.id, attachment_name, e,
+                    "File upload processing failed for chat_id=%s",
+                    chat.id
                 )
+
                 error_msg = Message.objects.create(
                     chat=chat,
                     role='assistant',
                     content=f"❌ Failed to process file: {str(e)}",
                 )
-                serializer = MessageSerializer(error_msg, context={'request': request})
-                return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+                serializer = MessageSerializer(
+                    error_msg,
+                    context={'request': request}
+                )
+
+                return Response(
+                    serializer.data,
+                    status=status.HTTP_400_BAD_REQUEST
+                )
  
         # --- Handle regular chat / document Q&A ---
         existing_user_msg = Message.objects.filter(
@@ -1220,56 +1253,109 @@ class StreamingChatAPIView(APIView):
         user = resolve_request_user(request, chat=chat)
  
         user_text = request.data.get('content', '').strip()
-        attachment = request.FILES.get('attachment')
+        attachments = request.FILES.getlist('attachment')
+
+        first_attachment = attachments[0] if attachments else None
  
-        if not user_text and not attachment:
+        if not user_text and not attachments:
             return Response(
                 {'error': 'content or attachment is required'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
  
-        attachment_name = getattr(attachment, 'name', '') if attachment else ''
-        attachment_content_type = getattr(attachment, 'content_type', '') if attachment else ''
+        attachment_name = (getattr(first_attachment, 'name', '') if first_attachment else '')
+
+        attachment_content_type = (getattr(first_attachment, 'content_type', '') if first_attachment else '')
         allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png','.webp')
  
         # --- Handle file upload for RAG (non-streaming path) ---
-        if attachment_name.lower().endswith(allowed_ext):
-            file_bytes = attachment.read()
-            user_msg = Message.objects.create(
-                chat=chat,
-                role='user',
-                content=user_text if user_text else f"[Uploaded file: {attachment_name}]",
-                attachment=attachment,
-                attachment_name=attachment_name,
-                attachment_content_type=attachment_content_type,
-            )
- 
+        if attachments:
+
+            processed_files = []
+            total_chunks = 0
+
             try:
-                # Process in isolated thread (fixes Windows IocpProactor conflict)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        _run_pdf_processing, chat, file_bytes, attachment_name
+
+                # Delete old chunks ONCE
+                DocumentChunk.objects.filter(chat=chat).delete()
+
+                for attachment in attachments:
+
+                    attachment_name = attachment.name
+                    attachment_content_type = attachment.content_type
+
+                    if not attachment_name.lower().endswith(allowed_ext):
+                        continue
+
+                    file_bytes = attachment.read()
+
+                    Message.objects.create(
+                        chat=chat,
+                        role='user',
+                        content=f"[Uploaded file: {attachment_name}]",
+                        attachment=attachment,
+                        attachment_name=attachment_name,
+                        attachment_content_type=attachment_content_type,
                     )
-                    num_chunks = future.result()
- 
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+
+                        future = executor.submit(
+                            _run_pdf_processing,
+                            chat,
+                            file_bytes,
+                            attachment_name
+                        )
+
+                        num_chunks = future.result()
+
+                    total_chunks += num_chunks
+                    processed_files.append(attachment_name)
+
                 if not user_text:
+
                     completion_msg = Message.objects.create(
                         chat=chat,
                         role='assistant',
-                        content=f'✅ File "{attachment_name}" processed ({num_chunks} chunks). You can now ask questions about it.',
+                        content=(
+                            f'✅ {len(processed_files)} file(s) processed '
+                            f'({total_chunks} chunks).\n\n'
+                            + "\n".join(processed_files)
+                        ),
                     )
-                    serializer = MessageSerializer(completion_msg, context={'request': request})
-                    return Response(serializer.data, status=status.HTTP_201_CREATED)
- 
+
+                    serializer = MessageSerializer(
+                        completion_msg,
+                        context={'request': request}
+                    )
+
+                    return Response(
+                        serializer.data,
+                        status=status.HTTP_201_CREATED
+                    )
+
             except Exception as e:
-                logger.exception("File upload processing failed for streaming view: %s", e)
+
+                logger.exception(
+                    "File upload processing failed for streaming view: %s",
+                    e
+                )
+
                 error_msg = Message.objects.create(
                     chat=chat,
                     role='assistant',
                     content=f"❌ Failed to process file: {str(e)}",
                 )
-                serializer = MessageSerializer(error_msg, context={'request': request})
-                return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
+
+                serializer = MessageSerializer(
+                    error_msg,
+                    context={'request': request}
+                )
+
+                return Response(
+                    serializer.data,
+                    status=status.HTTP_400_BAD_REQUEST
+                )
  
         # --- Save user message ---
         existing_user_msg = Message.objects.filter(
@@ -1283,7 +1369,7 @@ class StreamingChatAPIView(APIView):
                 chat=chat,
                 role='user',
                 content=user_text or f"[Uploaded file: {attachment_name}]",
-                attachment=attachment if attachment else None,
+                attachment=first_attachment if first_attachment else None,
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
             )
