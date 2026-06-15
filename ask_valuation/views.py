@@ -106,7 +106,7 @@ def _build_messages_payload(
     Assemble the full OpenAI messages payload.
     """
     guide_names = ", ".join(g.name for g in session.selected_guides.all())
-    system_prompt = session.system_prompt or ""
+    system_prompt = VALUATION_SYSTEM_PROMPT
     messages_payload: list[dict] = []
 
     if system_prompt:
@@ -146,6 +146,104 @@ def _build_messages_payload(
     messages_payload.append({"role": "user", "content": user_text})
     return messages_payload
 
+
+VALUATION_SYSTEM_PROMPT = """
+You are a senior valuation expert assistant specializing in analyzing valuation guides, professional standards, technical manuals, methodologies, and reference documents. Your primary responsibility is to answer the user's question using ONLY the retrieved document context provided to you.
+
+IMPORTANT RULES:
+- Use only information found in the retrieved document context.
+- Never invent facts, examples, calculations, page numbers, or references.
+- Never use external knowledge unless explicitly requested.
+- If the retrieved content does not contain enough information to answer the question, clearly state this.
+
+RESPONSE FORMAT:
+
+# Answer
+
+Begin with a direct answer to the user's question.
+
+Do NOT start with phrases such as 'Based on the provided context' or 'According to the document'.
+
+## Overview
+Provide a clear explanation of the topic.
+
+## Detailed Explanation
+Provide a thorough explanation of the relevant guidance, methodology, principles, and requirements.
+
+For every concept discussed, explain:
+1. What it means.
+2. Why it is important.
+3. When it applies.
+4. How it is used in practice.
+5. Key assumptions.
+6. Limitations.
+7. Exceptions.
+8. Practical implications.
+
+Expand the explanation substantially instead of merely summarizing retrieved text. Assume the user prefers a detailed professional explanation. Generate approximately 2-3 times more detail than a standard answer whenever sufficient source material exists.
+
+## Key Principles or Requirements
+Present important requirements, criteria, or guidance in bullet points.
+
+## Practical Application
+Explain how the guidance would be applied in real-world valuation assignments and professional practice.
+
+## Examples and Illustrations from the Guide
+If the retrieved content contains examples, illustrations, calculations, case studies, scenarios, or tables:
+- Include them.
+- Explain them step-by-step.
+- Explain their significance.
+- Explain how they relate to the user's question.
+
+If no example exists, explicitly state:
+'No specific example or illustration was found in the retrieved sections of the guide.'
+
+## Important Considerations
+Discuss assumptions, limitations, caveats, professional judgment areas, exceptions, and risks of misapplication, only if supported by the retrieved content.
+
+## Sources
+For every major section, include source references.
+
+Use the format:
+Source: Page X
+
+or
+
+Source: Pages X, Y, Z
+
+If a document name is available:
+
+Source: [Document Name], Page X
+
+Never invent page numbers.
+Always preserve source traceability.
+
+When multiple retrieved chunks are available:
+- Combine information intelligently.
+- Remove duplication.
+- Present one coherent answer.
+- Preserve all relevant page references.
+
+If formulas, calculations, valuation models, or methodologies appear in the retrieved content:
+- Explain each component.
+- Explain how it is used.
+- Explain the interpretation.
+- Walk through any available example calculations.
+
+Use tables whenever they improve readability.
+
+Act like a senior valuation consultant and instructor. Your objective is not only to answer the question but also to help the user understand the reasoning, application, implications, and professional interpretation of the guidance.
+
+# Summary
+
+After every answer, provide a Summary section containing 7-10 concise bullet points highlighting the most important takeaways.
+
+If the retrieved content is insufficient, state:
+
+'The retrieved sections of the guide do not provide enough information to fully answer this question.'
+
+Writing style must be professional, consultant-level, educational, highly detailed, and easy to understand.
+"""
 
 # ─────────────────────────────────────────────
 # Guide CRUD
@@ -645,6 +743,102 @@ class DeleteGuideAPIView(APIView):
             {
                 "message": f'Guide "{guide_name}" deleted successfully.',
                 "deleted_chunks": chunk_count,
+            },
+            status=status.HTTP_200_OK,
+        )
+        
+class OpenGuideChatAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        guide_ids = request.data.get("guide_ids", [])
+
+        if not isinstance(guide_ids, list) or not guide_ids:
+            return Response(
+                {"error": "guide_ids must be a non-empty list"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        guides = list(
+            Guide.objects.filter(
+                id__in=guide_ids,
+                is_active=True
+            )
+        )
+
+        if len(guides) != len(set(guide_ids)):
+            return Response(
+                {"error": "One or more guides are invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        requested_ids = set(guide_ids)
+
+        # Find existing session with exact same guides
+        sessions = (
+            ValuationSession.objects
+            .filter(owner=request.user)
+            .prefetch_related("selected_guides")
+        )
+
+        for session in sessions:
+            session_ids = set(
+                session.selected_guides.values_list(
+                    "id",
+                    flat=True
+                )
+            )
+
+            if session_ids == requested_ids:
+                return Response({
+                    "session_id": session.id,
+                    "existing": True
+                })
+
+        # Create new session
+        title = " + ".join(
+            g.name for g in guides
+        )
+
+        session = ValuationSession.objects.create(
+            owner=request.user,
+            title=title,
+            system_prompt=VALUATION_SYSTEM_PROMPT
+        )
+
+        session.selected_guides.set(guides)
+
+        return Response({
+            "session_id": session.id,
+            "existing": False
+        })
+        
+class ClearSessionAPIView(APIView):
+    """
+    Delete all messages from a session but keep the session itself.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, pk):
+        session = get_object_or_404(
+            ValuationSession,
+            pk=pk,
+            owner=request.user
+        )
+
+        deleted_count = session.messages.count()
+
+        session.messages.all().delete()
+
+        session.updated_at = timezone.now()
+        session.save(update_fields=["updated_at"])
+
+        return Response(
+            {
+                "message": "Chat history cleared successfully.",
+                "deleted_messages": deleted_count,
+                "session_id": session.id,
             },
             status=status.HTTP_200_OK,
         )

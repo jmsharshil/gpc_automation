@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import (GuideListCreateAPIView, GuideDetailAPIView, GuideReprocessAPIView,ValuationSessionListCreateAPIView, ValuationSessionDetailAPIView,ValuationMessageListAPIView, AskQuestionAPIView,AskQuestionStreamAPIView, EditMessageAPIView, UpdateSessionGuidesAPIView,DeleteSessionAPIView, DeleteGuideAPIView,)
+from .views import (GuideListCreateAPIView, GuideDetailAPIView, GuideReprocessAPIView,ValuationSessionListCreateAPIView, ValuationSessionDetailAPIView,ValuationMessageListAPIView, AskQuestionAPIView,AskQuestionStreamAPIView, EditMessageAPIView, UpdateSessionGuidesAPIView,DeleteSessionAPIView, DeleteGuideAPIView, OpenGuideChatAPIView, ClearSessionAPIView)
 
 urlpatterns = [
     # ── Guides ──────────────────────────────────────────
@@ -21,5 +21,8 @@ urlpatterns = [
     # ── Ask (Q&A) ────────────────────────────────────────
     path('chats/<int:session_pk>/ask/', AskQuestionAPIView.as_view(), name='ask'),
     path('chats/<int:session_pk>/ask/stream/', AskQuestionStreamAPIView.as_view(), name='ask-stream'),
+    
+    path('guide-chat/open/', OpenGuideChatAPIView.as_view(), name='open-guide-chat'),  
+    path('chats/<int:pk>/clear/', ClearSessionAPIView.as_view(), name='session-clear'),
     
 ]
