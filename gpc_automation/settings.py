@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'articleai',
     'usermanagement',
     'ask_valuation',
+    'article_interpretation_ai',
 ]
 
 REST_FRAMEWORK = {
