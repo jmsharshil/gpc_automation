@@ -141,7 +141,14 @@ class ExtractionRecord(models.Model):
     updated in-place whenever the user edits a security field via the
     update API.
     """
-    user          = models.ForeignKey(
+    STATUS_CHOICES = [
+        ("pending","Pending"),
+        ("processing", "Processing"),
+        ("done","Done"),
+        ("failed","Failed"),
+    ]
+    
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True, blank=True,
@@ -150,7 +157,8 @@ class ExtractionRecord(models.Model):
     original_name = models.CharField(max_length=512, blank=True)
     company_name  = models.CharField(max_length=500, blank=True)
     document_name = models.CharField(max_length=500, blank=True)
-    # Living copy of the extraction JSON — updated by the patch API.
+    status= models.CharField(max_length=20,choices=STATUS_CHOICES,default="pending",db_index=True,)
+    error_message = models.TextField(blank=True)
     raw_json      = models.JSONField(default=dict)
     created_at    = models.DateTimeField(auto_now_add=True)
     updated_at    = models.DateTimeField(auto_now=True)

@@ -24,7 +24,7 @@ class ExtractionRecordListSerializer(serializers.ModelSerializer):
         model  = ExtractionRecord
         fields = [
             "id", "user", "original_name", "company_name",
-            "document_name", "created_at", "updated_at",
+            "document_name", "status", "error_message","created_at", "updated_at",
         ]
 
 
@@ -36,7 +36,7 @@ class ExtractionRecordDetailSerializer(serializers.ModelSerializer):
         model  = ExtractionRecord
         fields = [
             "id", "user", "original_name", "company_name",
-            "document_name", "raw_json", "created_at", "updated_at",
+            "document_name",  "status", "error_message","raw_json", "created_at", "updated_at",
         ]
 
 
@@ -48,21 +48,31 @@ class SecurityUpdateSerializer(serializers.Serializer):
     """
     Validates the PATCH body:
     {
-        "security_index": 0,               // required — 0-based position
-        "security_name":  "Series A ...",  // optional — used for validation/readability
+        "target":         "securities",    // optional — "securities" (default) or "cap_table"
+        "security_index": 0,               // required — 0-based position in the target array
+        "security_name":  "Series A ...", // optional — used for validation/readability
         "fields": {
             "conversion_ratio": "1:1.26",
             "oip_original_issue_price": "$1.00"
         }
     }
     """
+    TARGET_SECURITIES = "securities"
+    TARGET_CAP_TABLE  = "cap_table"
+    TARGET_CHOICES    = [TARGET_SECURITIES, TARGET_CAP_TABLE]
+
+    target         = serializers.ChoiceField(
+        choices=TARGET_CHOICES,
+        default=TARGET_SECURITIES,
+        required=False,
+        help_text="Which array inside raw_json to patch: 'securities' or 'cap_table'.",
+    )
     security_index = serializers.IntegerField(min_value=0)
     security_name  = serializers.CharField(required=False, allow_blank=True)
     fields         = serializers.DictField(
         child=serializers.CharField(allow_blank=True),
         allow_empty=False,
     )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Audit log serializer

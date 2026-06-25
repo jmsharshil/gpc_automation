@@ -717,6 +717,472 @@ def _compute_conversion_ratio(conversion_ratio_text: Any, conversion_price: Any,
         return f"1:{ratio:.4f}".rstrip("0").rstrip(".")
     return text
 
+def _normalize_authorized_count(value: Any, missing_as: str = "NA") -> str:
+    """Return only the authorized share count number, without words like 'shares'."""
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return missing_as
+    if text.lower() in {"not stated", "n/a", "na", "none", "null", "needs review", "series-specific"}:
+        return missing_as
+    m = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(?:authorized\s+)?shares?\b", text, re.I)
+    if not m:
+        m = re.search(r"\bshares?\b\D{0,40}(\d[\d,]*(?:\.\d+)?)", text, re.I)
+    if not m:
+        m = re.search(r"\d[\d,]*(?:\.\d+)?", text)
+    if not m:
+        return text
+    num = m.group(1) if m.lastindex else m.group(0)
+    try:
+        if "." in num:
+            f = float(num.replace(",", ""))
+            if abs(f - round(f)) < 1e-9:
+                return f"{int(round(f)):,}"
+            return f"{f:,.2f}".rstrip("0").rstrip(".")
+        return f"{int(num.replace(',', '')):,}"
+    except Exception:
+        return num.replace(" shares", "").replace(" share", "").strip()
+    
+def _normalize_dividend_rate_percent(value: Any, context: Any = "", missing_as: str = "") -> str:
+    """Return dividend rate as a percentage only where possible, e.g. 8%."""
+    text = "" if value is None else str(value).strip()
+    ctx = "" if context is None else str(context).strip()
+    combined = f"{text} {ctx}".strip()
+    if not combined:
+        return missing_as
+    if combined.lower() in {"not stated", "n/a", "na", "none", "null", "needs review"}:
+        return missing_as
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:percent|per\s*cent|%)", combined, re.I)
+    if m:
+        n = float(m.group(1))
+        if abs(n - round(n)) < 1e-9:
+            return f"{int(round(n))}%"
+        return f"{n:g}%"
+    # Handle common wording: "at the rate of 8 per annum" only if context is clearly dividend-related.
+    if re.search(r"dividend|dividends", combined, re.I):
+        m = re.search(r"(?:rate\s+of|equal\s+to)\s+(\d+(?:\.\d+)?)\s*(?:per\s+annum|annually|annual)", combined, re.I)
+        if m:
+            n = float(m.group(1))
+            return f"{int(n) if abs(n-round(n))<1e-9 else n:g}%"
+    return "Not stated" if text.lower() == "not stated" else missing_as
+ 
+ 
+def _normalize_dividend_type(value: Any, context: Any = "", missing_as: str = "NA") -> str:
+    """Classify dividend type, including Simple vs Compounding where stated."""
+    text = "" if value is None else str(value).strip()
+    ctx = "" if context is None else str(context).strip()
+    combined = f"{text} {ctx}".lower()
+    if not combined.strip():
+        return missing_as
+    if any(x in combined for x in ["compound", "compounded", "compounding"]):
+        return "Compounding"
+    if re.search(r"\bsimple\b", combined):
+        return "Simple"
+    if any(x in combined for x in ["non-cumulative", "non cumulative", "noncumulative"]):
+        return "Non-cumulative"
+    if any(x in combined for x in ["cumulative", "accrue", "accrued", "accumulated"]):
+        return "Cumulative"
+    if any(x in combined for x in ["when, as and if declared", "when as and if declared", "if and when declared"]):
+        return "When-and-if-declared"
+    if text.lower() in {"not stated", "n/a", "na", "none", "null", "needs review"}:
+        return missing_as
+    return text
+ 
+ 
+def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build a cap-table-style summary list from already-extracted securities.
+ 
+    Mirrors extract_articles.py's build_cap_table_summary() / "Cap Table Summary"
+    sheet, but returns `List[Dict]` (for data["cap_table"]) instead of a
+    pandas DataFrame written to Excel.
+ 
+    Presentation rules (unchanged from the original script):
+    - Remove the aggregate "Preferred Stock" row when series-level rows are present.
+    - Common Stock: blank out preference/participation/dividend/cap-dividend
+      fields; it is assigned the next liquidation rank after Preferred.
+    - Seniority is numeric (1, 2, 3...) rather than a long ranking sentence.
+    - Conversion Ratio is concise (e.g., 1:1, 2:1).
+    - Dividend Rate is shown as a percentage where it can be computed.
+    """
+    if not securities:
+        return []
+ 
+    missing_tokens = {"", "nan", "not stated", "n/a", "na", "none", "null", "needs review", "series-specific"}
+ 
+    def raw(value: Any) -> str:
+        return "" if value is None else str(value).strip()
+ 
+    def is_missing(value: Any) -> bool:
+        return raw(value).lower() in missing_tokens
+ 
+    def clean(value: Any, na: str = "NA") -> str:
+        text = raw(value)
+        return na if text.lower() in missing_tokens else text
+ 
+    def price_from(value: Any) -> str:
+        money = _first_money(value)
+        return money if money else clean(value)
+ 
+    def liq_pref_per_share(row: Dict[str, Any]) -> str:
+        name = raw(row.get("security_name"))
+        if "common" in name.lower() and "preferred" not in name.lower():
+            return ""
+        liq = raw(row.get("liquidation_preference"))
+        oip = raw(row.get("oip_original_issue_price"))
+        money = _first_money(liq)
+        if money:
+            return money
+        if re.search(r"\b(1\s*x|one\s+times|100%)\b", liq, re.I) and not is_missing(oip):
+            return price_from(oip)
+        if re.search(r"original\s+(issue|issuance|purchase)\s+price|\bOIP\b", liq, re.I) and not is_missing(oip):
+            return price_from(oip)
+        return clean(liq)
+ 
+    def participation_summary(row: Dict[str, Any]) -> str:
+        """Normalize participation for the Cap Table.
+ 
+        Check non-participating before participating, since the word
+        "participating" appears inside "Non-participating". Also classify
+        greater-of / deemed-conversion preferred as non-participating where
+        the remaining assets go only to Common Stock.
+        """
+        text = raw(row.get("participation_rights"))
+        combined = " ".join([
+            text,
+            raw(row.get("liquidation_preference")),
+            raw(row.get("conversion_ratio")),
+            raw(row.get("conversion_price")),
+            raw(row.get("source_text")),
+        ])
+        low = combined.lower()
+        if is_missing(text):
+            return "NA"
+        if any(x in low for x in ["non-participating", "non participating", "nonparticipating", "non-participating preferred"]):
+            if any(x in low for x in ["greater", "deemed conversion", "as-converted", "as converted"]):
+                return "Non-participating / greater-of"
+            return "Non-participating"
+        if any(x in low for x in ["deemed conversion", "as-converted", "as converted", "greater of"]):
+            if re.search(r"remaining\s+(assets|proceeds|funds).{0,120}common", low, re.I):
+                return "Non-participating / greater-of"
+        if "capped" in low or "participation cap" in low:
+            return "Capped Participation"
+        if "full participation" in low:
+            return "Full Participation"
+        if re.search(r"\bparticipat(?:e|es|ing|ion)\b", low) and not re.search(r"\bnon[-\s]?participat", low):
+            return "Full Participation"
+        return clean(text)
+ 
+    def participation_cap_value(value: Any) -> str:
+        text = raw(value)
+        if is_missing(text):
+            return "NA"
+        money = _first_money(text)
+        if money:
+            return money
+        m = re.search(r"\b\d+(?:\.\d+)?\s*x\b", text, re.I)
+        if m:
+            return m.group(0)
+        return clean(text)
+ 
+    def seniority_rank_from_row(row: Dict[str, Any], fallback: Any = "NA") -> Any:
+        """Use explicit Rank X already in the seniority field before recalculating."""
+        text = raw(row.get("seniority"))
+        m = re.search(r"\brank\s*[:#=\-]?\s*(\d{1,3})\b", text, re.I)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"\bseniority\s*[:#=\-]?\s*(\d{1,3})\b", text, re.I)
+        if m:
+            return int(m.group(1))
+        return fallback
+ 
+    def dividend_payable(row: Dict[str, Any]) -> str:
+        text = raw(row.get("dividend_paying"))
+        combined = f"{text} {raw(row.get('dividend_type'))} {raw(row.get('dividend_rate'))}".lower()
+        if any(x in combined for x in ["yes", "payable", "shall accrue", "shall be paid", "when, as and if declared", "when as and if declared"]):
+            return "Yes"
+        if re.search(r"\b(no|not entitled|none|n/a|na)\b", combined):
+            return "No"
+        return "NA"
+ 
+    def dividend_rate_pct(row: Dict[str, Any]) -> str:
+        text = raw(row.get("dividend_rate"))
+        context = " ".join([raw(row.get("dividend_paying")), raw(row.get("dividend_type")), raw(row.get("liquidation_preference")), raw(row.get("source_text"))])
+        if is_missing(text):
+            return _normalize_dividend_rate_percent("", context, missing_as="")
+        pct = _normalize_dividend_rate_percent(text, context, missing_as="")
+        if pct:
+            return pct
+        amount = _money_num(text)
+        if amount is None:
+            return clean(text)
+        # Prefer conversion price first; if unavailable, use issue/OIP price.
+        denominators: List[float] = []
+        cp = _money_num(row.get("conversion_price"))
+        oip = _money_num(row.get("oip_original_issue_price"))
+        if cp:
+            denominators.append(cp)
+        if oip and (not cp or abs(oip - cp) > 1e-9):
+            denominators.append(oip)
+        for denom in denominators:
+            if denom:
+                pct = amount / denom * 100
+                if 0 < pct < 100:
+                    rounded = round(pct)
+                    if abs(pct - rounded) <= 0.55:
+                        return f"{int(rounded)}%"
+                    return f"{pct:.1f}%".rstrip("0").rstrip(".") + "%"
+        return clean(text)
+ 
+    def conversion_ratio_for_cap_table(row: Dict[str, Any]) -> str:
+        text = raw(row.get("conversion_ratio"))
+        m = re.search(r"\b\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\b", text)
+        if m:
+            return re.sub(r"\s+", "", m.group(0))
+        cp = _money_num(row.get("conversion_price"))
+        oip = _money_num(row.get("oip_original_issue_price"))
+        if cp and oip and abs(cp - oip) < 1e-9:
+            return "1:1"
+        if cp and oip and cp != 0:
+            ratio = oip / cp
+            if abs(ratio - round(ratio)) < 0.01:
+                return f"{int(round(ratio))}:1"
+            return f"{ratio:.2f}:1"
+        return clean(text)
+ 
+    def issue_strike_price(row: Dict[str, Any]) -> str:
+        """Preferred issue/strike price for the cap table. Prefer explicit OIP; then safe fallbacks."""
+        oip_value = price_from(row.get("oip_original_issue_price"))
+        if oip_value not in {"", "NA", "N/A", "Not stated", "Needs review"}:
+            return oip_value
+ 
+        # Safe fallback: liquidation preference per share when it is a dollar value and the
+        # clause references OIP/original issue price.
+        liq_text = raw(row.get("liquidation_preference"))
+        liq_value = liq_pref_per_share(row)
+        if liq_value and liq_value not in {"NA", "N/A", "Not stated", "Needs review"}:
+            if re.search(r"original\s+(issue|issuance|purchase)\s+price|\bOIP\b|1\s*x|one\s+times", liq_text, re.I):
+                if _first_money(liq_value):
+                    return _first_money(liq_value)
+ 
+        # Last fallback: initial conversion price, but only if identified as initial/original.
+        conv_text = f"{raw(row.get('conversion_price'))} {raw(row.get('conversion_ratio'))}"
+        conv_value = price_from(row.get("conversion_price"))
+        if conv_value not in {"", "NA", "N/A", "Not stated", "Needs review"}:
+            if re.search(r"initial|original\s+conversion\s+price|initially", conv_text, re.I):
+                return conv_value
+        return ""
+ 
+    def cap_price_includes_dividends(row: Dict[str, Any]) -> str:
+        participation = raw(row.get("participation_rights")).lower()
+        if "capped" not in participation:
+            return ""
+        combined = f"{raw(row.get('participation_cap'))} {raw(row.get('liquidation_preference'))}".lower()
+        if any(x in combined for x in ["dividend", "declared but unpaid", "accrued but unpaid"]):
+            return "Yes"
+        return "No"
+ 
+    def assign_liquidation_ranks(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, int], int]:
+        """Assign numeric liquidation seniority ranks deterministically.
+ 
+        - Highest priority: explicit row-specific rank/ordinal in the seniority field
+          such as "Rank 5", "Fifth liquidation preference tier", "Second payment tier".
+        - Do not let Senior To / Junior To relationship logic overwrite explicit ranks.
+        - Use Junior To / Senior To only as fallback for rows without explicit ranks.
+        - Common Stock is ranked after the highest preferred rank.
+        """
+        preferred_rows = [
+            r for r in rows
+            if "preferred" in raw(r.get("security_name")).lower()
+            and raw(r.get("security_name")).lower() != "preferred stock"
+        ]
+        names = [raw(r.get("security_name")) for r in preferred_rows]
+        ranks: Dict[str, Optional[int]] = {name: None for name in names}
+ 
+        ordinal_map = {
+            "first": 1, "1st": 1,
+            "second": 2, "2nd": 2,
+            "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4,
+            "fifth": 5, "5th": 5,
+            "sixth": 6, "6th": 6,
+            "seventh": 7, "7th": 7,
+            "eighth": 8, "8th": 8,
+            "ninth": 9, "9th": 9,
+            "tenth": 10, "10th": 10,
+            "eleventh": 11, "11th": 11,
+            "twelfth": 12, "12th": 12,
+        }
+ 
+        def normalize_series_token(text: str) -> str:
+            t = raw(text).lower()
+            t = re.sub(r"[^a-z0-9]+", " ", t)
+            t = re.sub(r"\s+", " ", t).strip()
+            return t
+ 
+        def series_tokens(text: str) -> List[str]:
+            t = normalize_series_token(text)
+            tokens: List[str] = []
+            for m in re.finditer(r"\bseries\s+[a-z]+(?:\s+\d+)?\b", t):
+                tokens.append(m.group(0))
+            if re.search(r"\bcommon\b", t) and "preferred" not in t:
+                tokens.append("common")
+            return tokens
+ 
+        name_tokens: Dict[str, List[str]] = {name: series_tokens(name) for name in names}
+ 
+        def mentioned_names(text: str) -> List[str]:
+            low_tokens = set(series_tokens(text))
+            low = normalize_series_token(text)
+            found: List[str] = []
+            for n in names:
+                nts = name_tokens.get(n) or []
+                if any(tok in low_tokens for tok in nts) or normalize_series_token(n) in low:
+                    found.append(n)
+            out: List[str] = []
+            for n in found:
+                if n not in out:
+                    out.append(n)
+            return out
+ 
+        def explicit_rank(text: str) -> Optional[int]:
+            """Parse row-specific rank/tier wording."""
+            t = raw(text).lower()
+            if not t:
+                return None
+            m = re.search(r"\b(?:seniority|rank|tier|priority)\b\s*[:=\-]?\s*(\d{1,2})\b", t)
+            if m:
+                return int(m.group(1))
+            for word, num in ordinal_map.items():
+                patterns = [
+                    rf"\b{word}\b\s+(?:liquidation\s+)?(?:preference\s+)?(?:tier|rank|priority|payment|waterfall)",
+                    rf"\b{word}\b\s+(?:payment|distribution)\s+(?:tier|priority)",
+                    rf"(?:tier|rank|priority|payment)\s+\b{word}\b",
+                    rf"\b{word}\b.*\b(?:liquidation\s+preference\s+tier|payment\s+tier|distribution\s+tier)",
+                ]
+                if any(re.search(p, t) for p in patterns):
+                    return num
+            return None
+ 
+        # 1. Explicit row-specific ranks from the seniority field: never overwrite these later.
+        for r in preferred_rows:
+            name = raw(r.get("security_name"))
+            rank = explicit_rank(raw(r.get("seniority")))
+            if rank is not None:
+                ranks[name] = rank
+ 
+        # 2. Source Text fallback: only if row has no explicit rank and is near an ordinal.
+        def current_security_near_ordinal(source_text: str, name: str) -> Optional[int]:
+            t = normalize_series_token(source_text)
+            nts = name_tokens.get(name) or []
+            if not t or not nts:
+                return None
+            for word, num in ordinal_map.items():
+                for m in re.finditer(rf"\b{word}\b", t):
+                    start_i = max(0, m.start() - 220)
+                    end_i = min(len(t), m.end() + 220)
+                    window = t[start_i:end_i]
+                    if any(tok in window for tok in nts) and re.search(r"liquidation|preference|payment|distribution|tier|prior", window):
+                        return num
+            return None
+ 
+        for r in preferred_rows:
+            name = raw(r.get("security_name"))
+            if ranks[name] is None:
+                rank = current_security_near_ordinal(raw(r.get("source_text")), name)
+                if rank is not None:
+                    ranks[name] = rank
+ 
+        # 3. Junior To fallback: use only when no rank exists. Iteratively set rank to
+        # max(rank of senior securities) + 1 if senior ranks are known.
+        changed = True
+        while changed:
+            changed = False
+            for r in preferred_rows:
+                name = raw(r.get("security_name"))
+                if ranks[name] is not None:
+                    continue
+                senior_names = [n for n in mentioned_names(" ".join([raw(r.get("junior_to")), raw(r.get("seniority"))])) if n != name]
+                known = [ranks[n] for n in senior_names if ranks.get(n) is not None]
+                if known:
+                    ranks[name] = max(int(x) for x in known if x is not None) + 1
+                    changed = True
+ 
+        # 4. Senior To fallback: current row is above another known row.
+        changed = True
+        while changed:
+            changed = False
+            for r in preferred_rows:
+                name = raw(r.get("security_name"))
+                if ranks[name] is not None:
+                    continue
+                junior_names = [n for n in mentioned_names(raw(r.get("senior_to"))) if n != name]
+                known = [ranks[n] for n in junior_names if ranks.get(n) is not None]
+                if known:
+                    candidate = min(int(x) for x in known if x is not None) - 1
+                    if candidate >= 1:
+                        ranks[name] = candidate
+                        changed = True
+ 
+        # 5. Last fallback: count explicitly mentioned senior securities in Junior To text.
+        for r in preferred_rows:
+            name = raw(r.get("security_name"))
+            if ranks[name] is None:
+                senior_names = [n for n in mentioned_names(raw(r.get("junior_to"))) if n != name]
+                if senior_names:
+                    ranks[name] = len(set(senior_names)) + 1
+ 
+        # 6. Unresolved preferred rows go after known preferred ranks.
+        max_known = max([int(v) for v in ranks.values() if v is not None], default=0)
+        final_ranks: Dict[str, int] = {}
+        for name in names:
+            if ranks[name] is None:
+                final_ranks[name] = max_known + 1 if max_known else 1
+            else:
+                final_ranks[name] = int(ranks[name])
+ 
+        # Preserve explicit ranks and same-tier relationships, but close gaps if present.
+        unique = sorted(set(final_ranks.values()))
+        remap = {old: i + 1 for i, old in enumerate(unique)}
+        final_ranks = {n: remap[v] for n, v in final_ranks.items()}
+        common_rank = max(final_ranks.values(), default=0) + 1
+        return final_ranks, common_rank
+ 
+    # Remove aggregate Preferred Stock row where detailed series rows exist.
+    source_rows: List[Dict[str, Any]] = []
+    for sec in securities:
+        name = raw(sec.get("security_name"))
+        if not name:
+            continue
+        if name.lower() == "preferred stock":
+            continue
+        source_rows.append(sec)
+ 
+    ranks, common_rank = assign_liquidation_ranks(source_rows)
+    cap_table: List[Dict[str, Any]] = []
+    for row in source_rows:
+        name = raw(row.get("security_name"))
+        is_common = "common" in name.lower() and "preferred" not in name.lower()
+        is_preferred = "preferred" in name.lower()
+        cap_table.append({
+            "series_type": "" if is_common else ("Preferred Share" if is_preferred else clean(row.get("security_type"))),
+            "series_name": clean(name),
+            "authorized_count": _normalize_authorized_count(row.get("authorized_count")),
+            "issue_strike_price": "" if is_common else issue_strike_price(row),
+            "liq_pref_per_share": "" if is_common else liq_pref_per_share(row),
+            "seniority_in_liq_pref": seniority_rank_from_row(row, common_rank if is_common else ranks.get(name, "NA")),
+            "participation_rights": "" if is_common else participation_summary(row),
+            "participation_cap_per_share": "" if is_common else participation_cap_value(row.get("participation_cap")),
+            "conversion_price": "" if is_common else price_from(row.get("conversion_price")),
+            "conversion_ratio": "" if is_common else conversion_ratio_for_cap_table(row),
+            "dividend_payable": "" if is_common else dividend_payable(row),
+            "dividend_rate": "" if is_common else dividend_rate_pct(row),
+            "dividend_type": "" if is_common else _normalize_dividend_type(
+                row.get("dividend_type"),
+                " ".join([raw(row.get("dividend_paying")), raw(row.get("dividend_rate")), raw(row.get("source_text"))]),
+            ),
+            "cap_price_includes_dividends": "" if is_common else cap_price_includes_dividends(row),
+        })
+ 
+    return cap_table
 
 def _apply_conversion_ratio_normalization(data: Dict[str, Any]) -> Dict[str, Any]:
     """Overwrite each security's conversion_ratio with the computed numeric
@@ -1194,4 +1660,5 @@ def run_extraction(
 
     print(f"[ArticleExtractor] Extraction complete. Securities found: {len(data.get('securities') or [])}")
     data = _apply_conversion_ratio_normalization(data)
+    data["cap_table"] = _build_cap_table(data.get("securities") or [])
     return data
