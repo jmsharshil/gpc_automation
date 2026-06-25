@@ -103,6 +103,12 @@ def _run_extraction_thread(
         # ── Save result → DONE ────────────────────────────────────────────────
         # Refresh connection — it may have gone stale during the long OpenAI call.
         close_old_connections()
+        
+        company_name  = result.get("company_name", "")
+        document_name = result.get("document_name", "")
+        result["company_name"]  = company_name
+        result["document_name"] = document_name
+        
         rows = ExtractionRecord.objects.filter(pk=record_id).update(
             status=ExtractionRecord.STATUS_CHOICES[2][0],
             company_name=result.get("company_name", ""),
