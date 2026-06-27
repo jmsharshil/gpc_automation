@@ -1245,34 +1245,33 @@ import concurrent.futures  # keep import if used elsewhere; not used below anymo
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 20MB — adjust as needed
 
 
-def _process_attachment_in_background(chat, file_bytes, attachment_name):
-    """
-    Runs in a separate thread so the HTTP request can return immediately,
-    avoiding Azure's ~230s front-end timeout. Saves result/error as a
-    Message once done, same as the old synchronous flow used to do.
-    """
+def _process_attachment_in_background(chat_id, file_bytes, attachment_name):
     try:
+        chat = Chat.objects.get(pk=chat_id)
         num_chunks = _run_pdf_processing(chat, file_bytes, attachment_name)
 
         Message.objects.create(
             chat=chat,
             role='assistant',
-            content=(
-                f'✅ 1 file(s) processed '
-                f'({num_chunks} chunks).\n\n{attachment_name}'
-            ),
+            content=f'✅ 1 file(s) processed ({num_chunks} chunks).\n\n{attachment_name}',
         )
 
     except Exception as e:
         logger.exception(
             "Background file processing failed for chat_id=%s file=%s: %s",
-            chat.id, attachment_name, e,
+            chat_id, attachment_name, e,
         )
-        Message.objects.create(
-            chat=chat,
-            role='assistant',
-            content=f"❌ Failed to process file: {str(e)}",
-        )
+        chat = Chat.objects.filter(pk=chat_id).first()
+        if chat:
+            Message.objects.create(
+                chat=chat,
+                role='assistant',
+                content=f"❌ Failed to process file: {str(e)}",
+            )
+
+    finally:
+        # 🔓 always clear the flag, success or failure
+        Chat.objects.filter(pk=chat_id).update(is_processing_document=False)
 
 
 # ====================== STREAMING CHAT (SSE) ======================
@@ -1305,11 +1304,7 @@ class StreamingChatAPIView(APIView):
 
         # --- Handle file upload for RAG (now non-blocking) ---
         if attachments:
-
             try:
-                # Delete old chunks ONCE
-                DocumentChunk.objects.filter(chat=chat).delete()
-
                 queued_files = []
                 rejected_files = []
 
@@ -1321,14 +1316,9 @@ class StreamingChatAPIView(APIView):
                         continue
 
                     if attachment.size > MAX_UPLOAD_SIZE:
-                        rejected_files.append(
-                            f"{name} ({attachment.size // 1024 // 1024}MB > "
-                            f"{MAX_UPLOAD_SIZE // 1024 // 1024}MB limit)"
-                        )
+                        rejected_files.append(...)
                         continue
 
-                    # Read bytes now (request-bound file handle won't survive
-                    # past the response), then hand off to a background thread.
                     file_bytes = attachment.read()
 
                     Message.objects.create(
@@ -1340,9 +1330,13 @@ class StreamingChatAPIView(APIView):
                         attachment_content_type=content_type,
                     )
 
+                    # 🔒 mark chat as processing BEFORE starting the thread
+                    chat.is_processing_document = True
+                    chat.save(update_fields=['is_processing_document'])
+
                     thread = threading.Thread(
                         target=_process_attachment_in_background,
-                        args=(chat, file_bytes, name),
+                        args=(chat.pk, file_bytes, name),  # pass pk, not the instance — see note below
                         daemon=True,
                     )
                     thread.start()
@@ -1408,6 +1402,24 @@ class StreamingChatAPIView(APIView):
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
             )
+
+        # 🔒 NEW: refuse to answer while document is still being processed
+            chat.refresh_from_db(fields=['is_processing_document'])
+            if chat.is_processing_document:
+                wait_msg = Message.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content="⏳ Still processing your uploaded document — please wait a few seconds and ask again so I can answer using the full document context.",
+                )
+
+                def wait_stream():
+                    yield f"data: {wait_msg.content}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                response = StreamingHttpResponse(wait_stream(), content_type='text/event-stream')
+                response['Cache-Control'] = 'no-cache'
+                response['X-Accel-Buffering'] = 'no'
+                return response
 
         # --- Build messages_payload with RAG ---
         system_prompt = chat.system_prompt or ""

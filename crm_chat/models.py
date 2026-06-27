@@ -55,6 +55,7 @@ class Chat(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
     metadata = models.JSONField(default=dict, blank=True)
+    is_processing_document = models.BooleanField(default=False)
 
     has_document = models.BooleanField(default=False)
     document_name = models.CharField(max_length=512, blank=True)
