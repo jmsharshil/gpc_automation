@@ -211,7 +211,7 @@ def _get_decimal(value):
         return None
 
 def _db_regex_for_exact_phrase(phrase: str) -> str:
-    """
+    r"""
     Postgres regex for an exact, whole-word phrase match.
     Uses \m ... \M word boundaries around the full phrase.
     """
@@ -387,9 +387,9 @@ def _sentence_matches_phrase(description: str, words: list[str]) -> bool:
     return False
 
 def _stem_prefilter_q_for_words(field, words):
-    """
+    r"""
     Build a Q that matches rows where each word (by stem) appears somewhere.
-    For each word we create a regex like r'<stem>\w*' so 'management' -> stem 'manag' matches 'manage','management','managing'.
+    For each word we create a regex like r<stem>\w* so management -> stem manag matches manage,management,managing.
     For multiple words we AND the per-word Qs.
     """
     db_engine = (connection.settings_dict.get('ENGINE', '') or '').lower()
@@ -459,7 +459,7 @@ def _prefix_for_word(w: str) -> str:
     return base[:plen]
 
 def _db_regex_for_word_variant(prefix: str) -> str:
-    """
+    r"""
     Postgres regex using word boundaries. Prefix is already a stemmed base.
     Matches: \m{base}\w*\M
     """

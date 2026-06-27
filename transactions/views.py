@@ -197,7 +197,7 @@ def _text_contains_exact_phrase(text: str, phrase: str) -> bool:
     return bool(rgx.search(text_n))
 
 def _db_regex_for_exact_phrase(phrase: str) -> str:
-    """
+    r"""
     Postgres regex for an exact, whole-word phrase match.
     Uses \m ... \M word boundaries around the full phrase.
     """
@@ -224,7 +224,7 @@ def _prefix_for_word(w: str) -> str:
     return w
 
 def _db_regex_for_word_variant(prefix: str) -> str:
-    """
+    r"""
     Postgres regex using word boundaries. Prefix is already a stemmed base.
     Matches: \m{base}\w*\M
     """

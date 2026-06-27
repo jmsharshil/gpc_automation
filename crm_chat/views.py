@@ -1239,6 +1239,42 @@ class DocumentProcessingStatusAPIView(APIView):
             return Response({'status': 'none'}, status=status.HTTP_404_NOT_FOUND)
 
 
+import threading
+import concurrent.futures  # keep import if used elsewhere; not used below anymore
+
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 20MB — adjust as needed
+
+
+def _process_attachment_in_background(chat, file_bytes, attachment_name):
+    """
+    Runs in a separate thread so the HTTP request can return immediately,
+    avoiding Azure's ~230s front-end timeout. Saves result/error as a
+    Message once done, same as the old synchronous flow used to do.
+    """
+    try:
+        num_chunks = _run_pdf_processing(chat, file_bytes, attachment_name)
+
+        Message.objects.create(
+            chat=chat,
+            role='assistant',
+            content=(
+                f'✅ 1 file(s) processed '
+                f'({num_chunks} chunks).\n\n{attachment_name}'
+            ),
+        )
+
+    except Exception as e:
+        logger.exception(
+            "Background file processing failed for chat_id=%s file=%s: %s",
+            chat.id, attachment_name, e,
+        )
+        Message.objects.create(
+            chat=chat,
+            role='assistant',
+            content=f"❌ Failed to process file: {str(e)}",
+        )
+
+
 # ====================== STREAMING CHAT (SSE) ======================
 class StreamingChatAPIView(APIView):
     """
@@ -1247,121 +1283,120 @@ class StreamingChatAPIView(APIView):
     """
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
- 
+
     def post(self, request, chat_pk):
         chat = get_object_or_404(Chat, pk=chat_pk)
         user = resolve_request_user(request, chat=chat)
- 
+
         user_text = request.data.get('content', '').strip()
         attachments = request.FILES.getlist('attachment')
 
         first_attachment = attachments[0] if attachments else None
- 
+
         if not user_text and not attachments:
             return Response(
                 {'error': 'content or attachment is required'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
- 
-        attachment_name = (getattr(first_attachment, 'name', '') if first_attachment else '')
 
+        attachment_name = (getattr(first_attachment, 'name', '') if first_attachment else '')
         attachment_content_type = (getattr(first_attachment, 'content_type', '') if first_attachment else '')
-        allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png','.webp')
- 
-        # --- Handle file upload for RAG (non-streaming path) ---
+        allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png', '.webp')
+
+        # --- Handle file upload for RAG (now non-blocking) ---
         if attachments:
 
-            processed_files = []
-            total_chunks = 0
-
             try:
-
                 # Delete old chunks ONCE
                 DocumentChunk.objects.filter(chat=chat).delete()
 
+                queued_files = []
+                rejected_files = []
+
                 for attachment in attachments:
+                    name = attachment.name
+                    content_type = attachment.content_type
 
-                    attachment_name = attachment.name
-                    attachment_content_type = attachment.content_type
-
-                    if not attachment_name.lower().endswith(allowed_ext):
+                    if not name.lower().endswith(allowed_ext):
                         continue
 
+                    if attachment.size > MAX_UPLOAD_SIZE:
+                        rejected_files.append(
+                            f"{name} ({attachment.size // 1024 // 1024}MB > "
+                            f"{MAX_UPLOAD_SIZE // 1024 // 1024}MB limit)"
+                        )
+                        continue
+
+                    # Read bytes now (request-bound file handle won't survive
+                    # past the response), then hand off to a background thread.
                     file_bytes = attachment.read()
 
                     Message.objects.create(
                         chat=chat,
                         role='user',
-                        content=f"[Uploaded file: {attachment_name}]",
+                        content=f"[Uploaded file: {name}]",
                         attachment=attachment,
-                        attachment_name=attachment_name,
-                        attachment_content_type=attachment_content_type,
+                        attachment_name=name,
+                        attachment_content_type=content_type,
                     )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    thread = threading.Thread(
+                        target=_process_attachment_in_background,
+                        args=(chat, file_bytes, name),
+                        daemon=True,
+                    )
+                    thread.start()
 
-                        future = executor.submit(
-                            _run_pdf_processing,
-                            chat,
-                            file_bytes,
-                            attachment_name
-                        )
+                    queued_files.append(name)
 
-                        num_chunks = future.result()
-
-                    total_chunks += num_chunks
-                    processed_files.append(attachment_name)
-
-                if not user_text:
-
-                    completion_msg = Message.objects.create(
+                if rejected_files:
+                    Message.objects.create(
                         chat=chat,
                         role='assistant',
                         content=(
-                            f'✅ {len(processed_files)} file(s) processed '
-                            f'({total_chunks} chunks).\n\n'
-                            + "\n".join(processed_files)
+                            "⚠️ Some file(s) were too large and were skipped:\n"
+                            + "\n".join(rejected_files)
                         ),
                     )
 
-                    serializer = MessageSerializer(
-                        completion_msg,
-                        context={'request': request}
-                    )
+                if not user_text:
+                    if queued_files:
+                        completion_msg = Message.objects.create(
+                            chat=chat,
+                            role='assistant',
+                            content=(
+                                f"⏳ Processing {len(queued_files)} file(s)... "
+                                f"this may take a minute for large files.\n\n"
+                                + "\n".join(queued_files)
+                            ),
+                        )
+                    else:
+                        completion_msg = Message.objects.create(
+                            chat=chat,
+                            role='assistant',
+                            content="⚠️ No valid files to process.",
+                        )
 
-                    return Response(
-                        serializer.data,
-                        status=status.HTTP_201_CREATED
-                    )
+                    serializer = MessageSerializer(completion_msg, context={'request': request})
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
 
             except Exception as e:
-
                 logger.exception(
-                    "File upload processing failed for streaming view: %s",
-                    e
+                    "File upload handling failed for streaming view: %s", e
                 )
-
                 error_msg = Message.objects.create(
                     chat=chat,
                     role='assistant',
                     content=f"❌ Failed to process file: {str(e)}",
                 )
+                serializer = MessageSerializer(error_msg, context={'request': request})
+                return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
 
-                serializer = MessageSerializer(
-                    error_msg,
-                    context={'request': request}
-                )
-
-                return Response(
-                    serializer.data,
-                    status=status.HTTP_400_BAD_REQUEST
-                )
- 
         # --- Save user message ---
         existing_user_msg = Message.objects.filter(
             chat=chat, role='user'
         ).order_by('-created_at').first()
- 
+
         if existing_user_msg and existing_user_msg.content == user_text:
             user_msg = existing_user_msg
         else:
@@ -1373,14 +1408,14 @@ class StreamingChatAPIView(APIView):
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
             )
- 
+
         # --- Build messages_payload with RAG ---
         system_prompt = chat.system_prompt or ""
         messages_payload = []
- 
+
         if system_prompt:
             messages_payload.append({'role': 'system', 'content': system_prompt})
- 
+
         # RAG context
         if chat.has_document:
             try:
@@ -1394,7 +1429,7 @@ class StreamingChatAPIView(APIView):
                 user_setting = getattr(user, 'openai_setting', None)
                 max_chunks = getattr(user_setting, 'max_context_chunks', 5)
                 relevant_chunks = get_relevant_chunks_for_query(chat, query_embedding, max_chunks)
- 
+
                 if relevant_chunks:
                     context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in relevant_chunks]
                     rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
@@ -1407,15 +1442,15 @@ class StreamingChatAPIView(APIView):
                         })
             except Exception as e:
                 logger.error("RAG retrieval failed in streaming view: %s", e)
- 
+
         # Conversation history
         recent_messages = chat.messages.all().order_by('-created_at')[:10][::-1]
         for m in recent_messages:
             if m.pk != user_msg.pk:
                 messages_payload.append({'role': m.role, 'content': m.content or ''})
- 
+
         messages_payload.append({'role': 'user', 'content': user_text})
- 
+
         # Model params
         user_setting = getattr(user, 'openai_setting', None)
         model = (
@@ -1425,17 +1460,17 @@ class StreamingChatAPIView(APIView):
         )
         max_tokens = int(request.data.get('max_tokens') or getattr(user_setting, 'max_tokens', 2000))
         temperature = float(request.data.get('temperature') or getattr(user_setting, 'temperature', 0.7))
- 
+
         logger.debug(
             "Streaming to OpenAI → model=%s temp=%s max_tokens=%s",
             model, temperature, max_tokens,
         )
- 
-        # --- SSE generator ---
+
+        # --- SSE generator (UNCHANGED) ---
         def event_stream():
             full_text = []
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
- 
+
             try:
                 with client.chat.completions.create(
                     model=model,
@@ -1451,8 +1486,7 @@ class StreamingChatAPIView(APIView):
                             full_text.append(text_piece)
                             escaped = text_piece.replace('\n', '\\n')
                             yield f"data: {escaped}\n\n"
- 
-                # Stream finished — save to DB
+
                 assistant_text = "".join(full_text)
                 Message.objects.create(
                     chat=chat,
@@ -1460,20 +1494,16 @@ class StreamingChatAPIView(APIView):
                     content=assistant_text,
                     metadata={'streaming': True},
                 )
-                # logger.info(
-                #     "Streaming complete for chat_id=%s chars=%s",
-                #     chat.id, len(assistant_text),
-                # )
- 
+
             except Exception as e:
                 logger.exception(
                     "Streaming OpenAI call failed for chat_id=%s: %s", chat.id, e
                 )
                 yield f"data: [ERROR] {str(e)}\n\n"
- 
+
             finally:
                 yield "data: [DONE]\n\n"
- 
+
         response = StreamingHttpResponse(
             event_stream(),
             content_type='text/event-stream',
