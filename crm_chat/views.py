@@ -1241,37 +1241,45 @@ class DocumentProcessingStatusAPIView(APIView):
 
 import threading
 import concurrent.futures  # keep import if used elsewhere; not used below anymore
+from django.db import close_old_connections
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 20MB — adjust as needed
 
 
 def _process_attachment_in_background(chat_id, file_bytes, attachment_name):
+    close_old_connections()  # important: raw threads don't get Django's auto connection handling
+    chat = None
     try:
         chat = Chat.objects.get(pk=chat_id)
         num_chunks = _run_pdf_processing(chat, file_bytes, attachment_name)
 
-        Message.objects.create(
-            chat=chat,
-            role='assistant',
-            content=f'✅ 1 file(s) processed ({num_chunks} chunks).\n\n{attachment_name}',
-        )
+        if num_chunks > 0:
+            Message.objects.create(
+                chat=chat,
+                role='assistant',
+                content=f'✅ 1 file(s) processed ({num_chunks} chunks).\n\n{attachment_name}',
+            )
+        else:
+            Message.objects.create(
+                chat=chat,
+                role='assistant',
+                content=f"⚠️ No extractable text found in {attachment_name}.",
+            )
 
     except Exception as e:
-        logger.exception(
-            "Background file processing failed for chat_id=%s file=%s: %s",
-            chat_id, attachment_name, e,
-        )
-        chat = Chat.objects.filter(pk=chat_id).first()
+        if chat is None:
+            chat = Chat.objects.filter(pk=chat_id).first()
         if chat:
             Message.objects.create(
                 chat=chat,
                 role='assistant',
-                content=f"❌ Failed to process file: {str(e)}",
+                content=f"❌ Failed to process file: {type(e).__name__}: {str(e)}",
             )
+            Chat.objects.filter(pk=chat_id).update(has_document=False)
 
     finally:
-        # 🔓 always clear the flag, success or failure
         Chat.objects.filter(pk=chat_id).update(is_processing_document=False)
+        close_old_connections()
 
 
 # ====================== STREAMING CHAT (SSE) ======================
@@ -1305,6 +1313,9 @@ class StreamingChatAPIView(APIView):
         # --- Handle file upload for RAG (now non-blocking) ---
         if attachments:
             try:
+                # Delete old chunks ONCE
+                DocumentChunk.objects.filter(chat=chat).delete()
+
                 queued_files = []
                 rejected_files = []
 
@@ -1316,7 +1327,10 @@ class StreamingChatAPIView(APIView):
                         continue
 
                     if attachment.size > MAX_UPLOAD_SIZE:
-                        rejected_files.append(...)
+                        rejected_files.append(
+                            f"{name} ({attachment.size // 1024 // 1024}MB > "
+                            f"{MAX_UPLOAD_SIZE // 1024 // 1024}MB limit)"
+                        )
                         continue
 
                     file_bytes = attachment.read()
@@ -1330,13 +1344,13 @@ class StreamingChatAPIView(APIView):
                         attachment_content_type=content_type,
                     )
 
-                    # 🔒 mark chat as processing BEFORE starting the thread
+                    # mark chat as processing BEFORE starting the thread
                     chat.is_processing_document = True
                     chat.save(update_fields=['is_processing_document'])
 
                     thread = threading.Thread(
                         target=_process_attachment_in_background,
-                        args=(chat.pk, file_bytes, name),  # pass pk, not the instance — see note below
+                        args=(chat.pk, file_bytes, name),
                         daemon=True,
                     )
                     thread.start()
@@ -1375,13 +1389,10 @@ class StreamingChatAPIView(APIView):
                     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
             except Exception as e:
-                logger.exception(
-                    "File upload handling failed for streaming view: %s", e
-                )
                 error_msg = Message.objects.create(
                     chat=chat,
                     role='assistant',
-                    content=f"❌ Failed to process file: {str(e)}",
+                    content=f"❌ Failed to process file: {type(e).__name__}: {str(e)}",
                 )
                 serializer = MessageSerializer(error_msg, context={'request': request})
                 return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
@@ -1405,21 +1416,21 @@ class StreamingChatAPIView(APIView):
 
         # 🔒 NEW: refuse to answer while document is still being processed
             chat.refresh_from_db(fields=['is_processing_document'])
-            if chat.is_processing_document:
-                wait_msg = Message.objects.create(
-                    chat=chat,
-                    role='assistant',
-                    content="⏳ Still processing your uploaded document — please wait a few seconds and ask again so I can answer using the full document context.",
-                )
+        if chat.is_processing_document:
+            wait_msg = Message.objects.create(
+                chat=chat,
+                role='assistant',
+                content="⏳ Still processing your uploaded document — please wait a few seconds and ask again so I can answer using the full document context.",
+            )
 
-                def wait_stream():
-                    yield f"data: {wait_msg.content}\n\n"
-                    yield "data: [DONE]\n\n"
+            def wait_stream():
+                yield f"data: {wait_msg.content}\n\n"
+                yield "data: [DONE]\n\n"
 
-                response = StreamingHttpResponse(wait_stream(), content_type='text/event-stream')
-                response['Cache-Control'] = 'no-cache'
-                response['X-Accel-Buffering'] = 'no'
-                return response
+            response = StreamingHttpResponse(wait_stream(), content_type='text/event-stream')
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'
+            return response
 
         # --- Build messages_payload with RAG ---
         system_prompt = chat.system_prompt or ""
