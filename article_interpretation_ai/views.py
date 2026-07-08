@@ -211,14 +211,26 @@ class ArticleExtractView(APIView):
             )
 
         # ── 2. Resolve per-user OpenAI settings ───────────────────────────────
+        global_setting = ArticleGlobalOpenAISetting.get_settings()
         user_setting = getattr(request.user, "articles_openai_setting", None)
-        model = getattr(user_setting, "default_model", None) or DEFAULT_MODEL
-        max_chars = getattr(user_setting, "max_chars", None) or DEFAULT_MAX_CHARS
-        reasoning_effort = getattr(user_setting, "reasoning_effort", None) or DEFAULT_REASONING_EFFORT
-        quality_reasoning_effort = getattr(user_setting, "quality_reasoning_effort", None) or DEFAULT_QUALITY_REASONING_EFFORT
-        max_output_tokens = getattr(user_setting, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
-        quality_pass = getattr(user_setting, "quality_pass", True)
-        seniority_pass = getattr(user_setting, "seniority_pass", True)
+
+        model = (getattr(user_setting, "default_model", None) or global_setting.default_model)
+        max_chars = (getattr(user_setting, "max_chars", None) or global_setting.max_chars)
+        reasoning_effort = (getattr(user_setting, "reasoning_effort", None) or global_setting.reasoning_effort)
+        quality_reasoning_effort = (getattr(user_setting, "quality_reasoning_effort", None) or global_setting.quality_reasoning_effort)
+        max_output_tokens = (getattr(user_setting, "max_output_tokens", None) or global_setting.max_output_tokens)
+        quality_pass = (getattr(user_setting, "quality_pass", None) if user_setting is not None else None)
+        
+        if quality_pass is None:
+            quality_pass = global_setting.quality_pass
+
+        seniority_pass = (
+            getattr(user_setting, "seniority_pass", None)
+            if user_setting is not None
+            else None
+        )
+        if seniority_pass is None:
+            seniority_pass = global_setting.seniority_pass
 
         api_key = getattr(settings, "OPENAI_API_KEY", None) or os.environ.get("OPENAI_API_KEY")
         if not api_key:
