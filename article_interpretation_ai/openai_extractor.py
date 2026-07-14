@@ -356,6 +356,63 @@ SENIORITY_TIER_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
+OIP_PRICE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "company_name": {"type": "string"},
+        "document_name": {"type": "string"},
+        "security_oip_prices": {
+            "type": "array",
+            "description": "Exact source-derived OIP / original issue price per expected security.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "security_name": {"type": "string"},
+                    "oip_original_issue_price": {"type": "string"},
+                    "source_basis": {"type": "string"},
+                    "source_text": {"type": "string"},
+                },
+                "required": ["security_name", "oip_original_issue_price", "source_basis", "source_text"],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["company_name", "document_name", "security_oip_prices", "notes"],
+    "additionalProperties": False,
+}
+
+
+def _oip_text_format_schema() -> Dict[str, Any]:
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "exact_oip_source_prices",
+            "schema": OIP_PRICE_SCHEMA,
+            "strict": True,
+        }
+    }
+
+
+OIP_PRICE_REVIEW_INSTRUCTIONS = """
+You are performing an exact OIP / Original Issue Price validation from Articles / Charter documents.
+
+Your only task is to read the uploaded source document and return the exact Original Issue Price / Original Issuance Price / Original Purchase Price / Issue Price for each expected security.
+
+Return strict JSON matching the schema only.
+
+Critical rules:
+- Use the exact security names from the provided expected security list. Do not invent or shorten names.
+- Focus on definitions and clauses containing Original Issue Price, Original Issuance Price, Original Purchase Price, Issue Price, Purchase Price, price per share, or initial conversion price if it explicitly equals OIP.
+- Map each dollar amount to the correct series. Be extremely careful with decimals.
+- If a clause says '$0.606174 per share for Series Seed-1 Preferred Stock and $0.484940 per share for Series Seed-2 Preferred Stock', return those exact values.
+- Do not use par value, public offering price, option exercise price, warrant price, common stock price, or fair market value as OIP.
+- If no OIP is stated for a security, return 'Not stated'.
+- If the security is Common Stock, return 'N/A' unless the document clearly states an issue price.
+- Preserve a short source_text excerpt containing the exact price and security name.
+""".strip()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,16 +496,6 @@ def _needs_quality_review(data: Dict[str, Any]) -> bool:
         if _value_is_weak(sec.get("seniority")):
             return True
     return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Seniority-waterfall name-matching helpers — ported verbatim from
-# extract_articles.py (normalize_security_name_for_match,
-# match_tier_security_to_existing, _series_token_from_name,
-# match_tier_security_to_all_existing, apply_seniority_tiers_to_data).
-# Logic unchanged; only renamed with a leading underscore for module-private
-# consistency with the rest of this file.
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _normalize_security_name_for_match(value: str) -> str:
     t = str(value or "").lower()
@@ -566,6 +613,58 @@ def _match_tier_security_to_all_existing(tier_name: str, existing_names: List[st
 
     return found
 
+def _apply_oip_prices_to_data(data: Dict[str, Any], oip_json: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply exact OIP prices returned by the dedicated source-document OIP pass."""
+    if not data or not oip_json:
+        return data
+    data["_oip_review_json"] = oip_json
+    securities = data.get("securities", []) or []
+    existing_names = [str(sec.get("security_name", "")) for sec in securities]
+
+    price_map: Dict[str, Dict[str, str]] = {}
+    for row in oip_json.get("security_oip_prices", []) or []:
+        sec_name = str(row.get("security_name", "")).strip()
+        price_text = str(row.get("oip_original_issue_price", "")).strip()
+        if not sec_name or not price_text:
+            continue
+        matched_names = _match_tier_security_to_all_existing(sec_name, existing_names) or [sec_name]
+        for matched in matched_names:
+            price_map[matched] = {
+                "price": price_text,
+                "basis": str(row.get("source_basis", "Dedicated exact OIP extraction")),
+                "source_text": str(row.get("source_text", "")),
+            }
+
+    applied = 0
+    for sec in securities:
+        name = str(sec.get("security_name", "")).strip()
+        if not name or "preferred" not in name.lower():
+            continue
+        info = price_map.get(name)
+        if not info:
+            continue
+        price_text = info.get("price", "")
+        price_num = _money_to_float(price_text)
+        if price_num is None:
+            continue
+        corrected = _fmt_money_num(price_num)
+        current = _money_to_float(sec.get("oip_original_issue_price"))
+        if current is None or abs(current - price_num) > max(0.0000005, abs(price_num) * 0.0005):
+            sec["oip_original_issue_price"] = corrected
+            conv = _money_to_float(sec.get("conversion_price"))
+            if conv is None or current is None or abs(conv - current) <= max(0.0000005, abs(current or 0) * 0.0005):
+                sec["conversion_price"] = corrected
+            old_source = str(sec.get("source_text", ""))
+            if info.get("source_text") and info["source_text"] not in old_source:
+                sec["source_text"] = (old_source + "\n\nOIP EXACT-PRICE SOURCE: " + info["source_text"]).strip()
+            flags = str(sec.get("review_flags", ""))
+            note = "OIP corrected by dedicated source-document price validation"
+            if note not in flags:
+                sec["review_flags"] = (flags + "; " + note).strip("; ").strip()
+            applied += 1
+    data["_oip_review_applied_count"] = applied
+    return data
+
 
 def _apply_seniority_tiers_to_data(data: Dict[str, Any], tiers_json: Dict[str, Any]) -> Dict[str, Any]:
     """Overwrite extracted seniority fields using a dedicated seniority exact-rank JSON result.
@@ -649,26 +748,6 @@ def _apply_seniority_tiers_to_data(data: Dict[str, Any], tiers_json: Dict[str, A
     return data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Conversion ratio normalization — ported verbatim (math unchanged) from
-# extract_articles.py's build_cap_table_summary() inner helpers: first_money(),
-# money_num(), and conversion_ratio(). In the original script these only ran
-# while building the Cap Table Summary Excel sheet. They are pure deterministic
-# math over already-extracted oip_original_issue_price / conversion_price
-# strings — no LLM call involved — so they are safe to apply directly to the
-# detailed JSON rows here, without pulling in the rest of the cap-table layer
-# (rank reassignment, participation classification, common-stock blanking,
-# etc., which are NOT ported here on purpose).
-#
-# Note: this does NOT add anything to review_flags. In extract_articles.py,
-# review_flags is never written by any Python code except the one seniority
-# marker above — any other flag wording (e.g. "Conversion ratio calculated
-# from OIP divided by initial conversion price") seen in a sample Excel was
-# written by the model itself during that particular run, not by this
-# function or any other code in the script. There is no fixed flag
-# vocabulary to reproduce here.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _first_money(text: Any) -> str:
     text = "" if text is None else str(text).strip()
     m = re.search(r"\$\s*\d[\d,]*(?:\.\d+)?", text)
@@ -717,6 +796,71 @@ def _compute_conversion_ratio(conversion_ratio_text: Any, conversion_price: Any,
         return f"1:{ratio:.4f}".rstrip("0").rstrip(".")
     return text
 
+def _money_to_float(value: Any) -> Optional[float]:
+    m = re.search(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)", str(value or ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _fmt_money_num(value: float, decimals: int = 9) -> str:
+    text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    return "$" + (text if text else "0")
+
+
+def _series_markers(name: Any) -> List[str]:
+    t = str(name or "").lower()
+    t = re.sub(r"preferred\s+stock|preferred\s+shares|common\s+stock|shares|stock", " ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    markers = []
+    for m in re.finditer(r"\bseries\s+[a-z0-9]+(?:\s+[a-z0-9]+)?\b", t):
+        markers.append(m.group(0))
+    if "seed series" in t:
+        markers.append("seed series")
+    if t and t not in markers:
+        markers.append(t)
+    return [m for m in markers if len(m) >= 3]
+
+
+def _normalize_source_text_for_match(text: Any) -> str:
+    t = str(text or "").lower()
+    t = t.replace("–", "-").replace("—", "-")
+    t = re.sub(r"[^a-z0-9.$%]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _nearest_oip_from_source(security_name: Any, text_blob: str) -> Optional[float]:
+    low = _normalize_source_text_for_match(text_blob)
+    if not low:
+        return None
+    markers = _series_markers(security_name)
+    best: Optional[Tuple[int, float]] = None
+    for marker in markers:
+        marker = _normalize_source_text_for_match(marker)
+        if not marker:
+            continue
+        for m in re.finditer(re.escape(marker), low):
+            start = max(0, m.start() - 420)
+            end = min(len(low), m.end() + 420)
+            window = low[start:end]
+            if not re.search(r"original\s+(issue|issuance|purchase)\s+price|issue\s+price|purchase\s+price|price\s+per\s+share|per\s+share", window, re.I):
+                continue
+            for money in re.finditer(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)", window):
+                try:
+                    value = float(money.group(1).replace(",", ""))
+                except Exception:
+                    continue
+                marker_pos = m.start() - start
+                dist = abs(money.start() - marker_pos)
+                if best is None or dist < best[0]:
+                    best = (dist, value)
+    return None if best is None else best[1]
+
 def _normalize_authorized_count(value: Any, missing_as: str = "NA") -> str:
     """Return only the authorized share count number, without words like 'shares'."""
     text = "" if value is None else str(value).strip()
@@ -764,26 +908,60 @@ def _normalize_dividend_rate_percent(value: Any, context: Any = "", missing_as: 
             n = float(m.group(1))
             return f"{int(n) if abs(n-round(n))<1e-9 else n:g}%"
     return "Not stated" if text.lower() == "not stated" else missing_as
- 
- 
+
 def _normalize_dividend_type(value: Any, context: Any = "", missing_as: str = "NA") -> str:
-    """Classify dividend type, including Simple vs Compounding where stated."""
+    """Classify dividend type conservatively for valuation output.
+
+    Key rules:
+    - Negative wording is checked first: non-cumulative before cumulative,
+      non-compounded before compounded.
+    - "When declared" only, without explicit accrual/cumulative wording, is
+      classified as Non-cumulative per Knowcraft presentation convention.
+    """
     text = "" if value is None else str(value).strip()
     ctx = "" if context is None else str(context).strip()
     combined = f"{text} {ctx}".lower()
     if not combined.strip():
         return missing_as
-    if any(x in combined for x in ["compound", "compounded", "compounding"]):
-        return "Compounding"
-    if re.search(r"\bsimple\b", combined):
-        return "Simple"
-    if any(x in combined for x in ["non-cumulative", "non cumulative", "noncumulative"]):
+
+    null_tokens = {"not stated", "n/a", "na", "none", "null", "needs review", ""}
+    if text.lower() in null_tokens and not ctx.strip():
+        return missing_as
+
+    # Non-cumulative / no accrual signals must be first.
+    non_cum_patterns = [
+        r"\bnon[-\s]?cumulative\b",
+        r"\bnot\s+cumulative\b",
+        r"\bshall\s+not\s+be\s+cumulative\b",
+        r"\bno\s+right\s+to\s+dividends?\s+shall\s+accrue\b",
+        r"\bshall\s+not\s+accrue\b",
+        r"\bno\s+dividends?\s+shall\s+accumulate\b",
+        r"\bno\s+right\s+to\s+receive\s+dividends?\b.*\bnot\s+declared\b",
+    ]
+    if any(re.search(p, combined, re.I) for p in non_cum_patterns):
         return "Non-cumulative"
-    if any(x in combined for x in ["cumulative", "accrue", "accrued", "accumulated"]):
+
+    has_non_compounded = bool(re.search(r"\bnon[-\s]?compounded\b|\bnot\s+compounded\b|\bnon[-\s]?compounding\b", combined, re.I))
+    has_compounded = bool(re.search(r"\bcompounded\b|\bcompounding\b|\bcompound\b", combined, re.I)) and not has_non_compounded
+    has_cumulative = bool(re.search(r"\bcumulative\b|\bshall\s+accrue\b|\baccrued\s+(?:and\s+)?unpaid\b|\baccumulated\s+(?:and\s+)?unpaid\b|\bdividends?\s+shall\s+accrue\b|\bwhether\s+or\s+not\s+declared\b", combined, re.I))
+
+    if has_cumulative and has_non_compounded:
+        return "Cumulative, non-compounded"
+    if has_cumulative and has_compounded:
+        return "Cumulative, compounded"
+    if has_cumulative:
         return "Cumulative"
-    if any(x in combined for x in ["when, as and if declared", "when as and if declared", "if and when declared"]):
-        return "When-and-if-declared"
-    if text.lower() in {"not stated", "n/a", "na", "none", "null", "needs review"}:
+    if has_non_compounded:
+        return "Cumulative, non-compounded"
+    if has_compounded:
+        return "Cumulative, compounded"
+    if re.search(r"\bsimple\b", combined, re.I):
+        return "Simple"
+
+    if re.search(r"when,?\s+as\s+and\s+if\s+declared|if\s+and\s+when\s+declared|when\s+declared|when\s+and\s+if\s+declared", combined, re.I):
+        return "Non-cumulative"
+
+    if text.lower() in null_tokens:
         return missing_as
     return text
  
@@ -821,13 +999,46 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def price_from(value: Any) -> str:
         money = _first_money(value)
         return money if money else clean(value)
- 
+    
+    def liquidation_multiplier(text: Any) -> Optional[float]:
+        t = raw(text).lower().replace("–", "-").replace("—", "-")
+        if not t:
+            return None
+        m = re.search(r"\b(\d+(?:\.\d+)?)\s*x\b", t)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+        phrase_map = {
+            "one and one fourth": 1.25, "one and one quarter": 1.25, "one and a quarter": 1.25,
+            "one and one half": 1.5, "one and a half": 1.5,
+            "two times": 2.0, "twice": 2.0, "one times": 1.0, "one time": 1.0,
+        }
+        for phrase, value in phrase_map.items():
+            if phrase in t and re.search(r"original\s+(issue|issuance|purchase)\s+price|\bOIP\b", t, re.I):
+                return value
+        return None
+
     def liq_pref_per_share(row: Dict[str, Any]) -> str:
         name = raw(row.get("security_name"))
         if "common" in name.lower() and "preferred" not in name.lower():
             return ""
         liq = raw(row.get("liquidation_preference"))
+        source = raw(row.get("source_text"))
         oip = raw(row.get("oip_original_issue_price"))
+        combined = f"{liq} {source}"
+
+        if re.search(r"qualified\s+capital\s+balance|qualified\s+capital\s+contribution", combined, re.I):
+            return "Qualified Capital Balance"
+
+        base = _money_num(oip)
+        mult = liquidation_multiplier(combined)
+        if base is not None and mult is not None:
+            return _fmt_money_num(base * mult)
+        if base is not None and re.search(r"original\s+(issue|issuance|purchase)\s+price|\bOIP\b|applicable\s+original|greater\s+of|liquidation\s+amount|liquidation\s+preference", combined, re.I):
+            return _fmt_money_num(base)
+
         money = _first_money(liq)
         if money:
             return money
@@ -866,9 +1077,9 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if "capped" in low or "participation cap" in low:
             return "Capped Participation"
         if "full participation" in low:
-            return "Full Participation"
+            return "Participating"
         if re.search(r"\bparticipat(?:e|es|ing|ion)\b", low) and not re.search(r"\bnon[-\s]?participat", low):
-            return "Full Participation"
+            return "Participating"
         return clean(text)
  
     def participation_cap_value(value: Any) -> str:
@@ -950,6 +1161,9 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
  
     def issue_strike_price(row: Dict[str, Any]) -> str:
         """Preferred issue/strike price for the cap table. Prefer explicit OIP; then safe fallbacks."""
+        combined_source = " ".join([raw(row.get("oip_original_issue_price")), raw(row.get("liquidation_preference")), raw(row.get("source_text"))])
+        if re.search(r"qualified\s+capital\s+balance|qualified\s+capital\s+contribution", combined_source, re.I):
+            return "Not fixed / contribution-based"
         oip_value = price_from(row.get("oip_original_issue_price"))
         if oip_value not in {"", "NA", "N/A", "Not stated", "Needs review"}:
             return oip_value
@@ -970,14 +1184,31 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if re.search(r"initial|original\s+conversion\s+price|initially", conv_text, re.I):
                 return conv_value
         return ""
- 
+
     def cap_price_includes_dividends(row: Dict[str, Any]) -> str:
-        participation = raw(row.get("participation_rights")).lower()
-        if "capped" not in participation:
+        cap_value = participation_cap_value(row.get("participation_cap"))
+        if raw(cap_value).lower() in {"", "na", "n/a", "not stated", "needs review", "none", "null"}:
             return ""
-        combined = f"{raw(row.get('participation_cap'))} {raw(row.get('liquidation_preference'))}".lower()
-        if any(x in combined for x in ["dividend", "declared but unpaid", "accrued but unpaid"]):
+
+        combined = " ".join([
+            raw(row.get("participation_cap")),
+            raw(row.get("source_text")),
+        ]).lower()
+
+        if any(x in combined for x in [
+            "excluding dividends", "excludes dividends", "does not include dividends",
+            "without dividends", "exclusive of dividends",
+        ]):
+            return "No"
+
+        if any(x in combined for x in [
+            "including dividends", "includes dividends", "inclusive of dividends",
+            "declared but unpaid", "declared and unpaid",
+            "accrued but unpaid", "accrued and unpaid",
+            "accumulated but unpaid", "accumulated and unpaid",
+        ]):
             return "Yes"
+
         return "No"
  
     def assign_liquidation_ranks(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, int], int]:
@@ -1145,14 +1376,37 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         final_ranks = {n: remap[v] for n, v in final_ranks.items()}
         common_rank = max(final_ranks.values(), default=0) + 1
         return final_ranks, common_rank
+
+    def conversion_price_summary(row: Dict[str, Any]) -> str:
+        combined_source = " ".join([raw(row.get("oip_original_issue_price")), raw(row.get("liquidation_preference")), raw(row.get("conversion_price")), raw(row.get("source_text"))])
+        if re.search(r"qualified\s+capital\s+balance|qualified\s+capital\s+contribution", combined_source, re.I):
+            return "Not stated / automatic conversion trigger"
+        return price_from(row.get("conversion_price"))
  
     # Remove aggregate Preferred Stock row where detailed series rows exist.
+
+    all_security_names = [raw(sec.get("security_name")) for sec in securities if raw(sec.get("security_name"))]
+    detailed_preferred_names = [
+        n for n in all_security_names
+        if "preferred" in n.lower()
+        and n.lower() not in {"preferred stock", "series preferred stock", "series seed preferred stock"}
+    ]
+    has_split_seed_series = any(re.search(r"\bseries\s+seed\s*[-–—]?\s*\d+", n, re.I) for n in all_security_names)
+    has_any_detailed_preferred = len(detailed_preferred_names) > 0
+
     source_rows: List[Dict[str, Any]] = []
     for sec in securities:
         name = raw(sec.get("security_name"))
         if not name:
             continue
-        if name.lower() == "preferred stock":
+        low_name = name.lower()
+        if low_name == "preferred stock" and has_any_detailed_preferred:
+            continue
+        if low_name == "series preferred stock" and has_any_detailed_preferred:
+            continue
+        if low_name == "series seed preferred stock" and has_split_seed_series:
+            continue
+        if "blank check" in low_name or "undesignated preferred" in low_name or "initially undesignated" in low_name:
             continue
         source_rows.append(sec)
  
@@ -1171,7 +1425,7 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "seniority_in_liq_pref": seniority_rank_from_row(row, common_rank if is_common else ranks.get(name, "NA")),
             "participation_rights": "" if is_common else participation_summary(row),
             "participation_cap_per_share": "" if is_common else participation_cap_value(row.get("participation_cap")),
-            "conversion_price": "" if is_common else price_from(row.get("conversion_price")),
+            "conversion_price": "" if is_common else conversion_price_summary(row),
             "conversion_ratio": "" if is_common else conversion_ratio_for_cap_table(row),
             "dividend_payable": "" if is_common else dividend_payable(row),
             "dividend_rate": "" if is_common else dividend_rate_pct(row),
@@ -1181,8 +1435,67 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ),
             "cap_price_includes_dividends": "" if is_common else cap_price_includes_dividends(row),
         })
- 
+    def _sort_key(r: Dict[str, Any]) -> Tuple[int, int, str]:
+        name = raw(r.get("series_name")).lower()
+        is_common = "common" in name and "preferred" not in name
+        is_pref = "preferred" in name
+        try:
+            rank = int(float(str(r.get("seniority_in_liq_pref", 999)).strip()))
+        except Exception:
+            rank = 999
+        group = 0 if is_pref else (2 if is_common else 1)
+        return (group, rank, name)
+
+    cap_table.sort(key=_sort_key)
     return cap_table
+
+    
+ 
+    # return cap_table
+
+def _validate_securities_against_source_text(
+    securities: List[Dict[str, Any]], source_document_text: str
+) -> List[Dict[str, Any]]:
+    """JSON-list equivalent of validate_terms_dataframe() in extract_articles.py.
+    Corrects OIP / conversion_price using deterministic source-text matching
+    (catches OCR/decimal misreads even when the model's own source_text is wrong).
+    """
+    if not securities:
+        return securities
+    text_blob = "\n".join(
+        str(sec.get(k, "")) for sec in securities
+        for k in ("source_text", "liquidation_preference", "oip_original_issue_price", "conversion_price")
+    )
+    for sec in securities:
+        name = str(sec.get("security_name", ""))
+        if "preferred" not in name.lower():
+            continue
+        if "blank check" in name.lower() or "undesignated" in name.lower():
+            continue
+        row_context = f"{sec.get('source_text','')} {sec.get('liquidation_preference','')} {sec.get('oip_original_issue_price','')}"
+        if re.search(r"qualified\s+capital\s+balance|qualified\s+capital\s+contribution", row_context, re.I):
+            continue
+
+        source_price = None
+        if source_document_text:
+            source_price = _nearest_oip_from_source(name, source_document_text)
+        if source_price is None:
+            source_price = _nearest_oip_from_source(name, f"{sec.get('source_text','')}\n{text_blob}")
+        if source_price is None:
+            continue
+
+        current = _money_to_float(sec.get("oip_original_issue_price"))
+        if current is None or abs(current - source_price) > max(0.0000005, abs(source_price) * 0.0005):
+            corrected = _fmt_money_num(source_price)
+            sec["oip_original_issue_price"] = corrected
+            conv = _money_to_float(sec.get("conversion_price"))
+            if conv is None or current is None or abs(conv - current) <= max(0.0000005, abs(current or 0) * 0.0005):
+                sec["conversion_price"] = corrected
+            flags = str(sec.get("review_flags", "") or "").strip()
+            note = "OIP corrected by source-price validation"
+            if note not in flags:
+                sec["review_flags"] = (flags + "; " + note).strip("; ").strip()
+    return securities
 
 def _apply_conversion_ratio_normalization(data: Dict[str, Any]) -> Dict[str, Any]:
     """Overwrite each security's conversion_ratio with the computed numeric
@@ -1197,35 +1510,6 @@ def _apply_conversion_ratio_normalization(data: Dict[str, Any]) -> Dict[str, Any
             sec.get("oip_original_issue_price"),
         )
     return data
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenAI call wrappers
-# ─────────────────────────────────────────────────────────────────────────────
-
-# def _extract_via_local_text(
-#     client,
-#     model: str,
-#     file_name: str,
-#     text: str,
-#     max_chars: int,
-# ) -> Dict[str, Any]:
-#     evidence = text[:max_chars]
-#     user_text = (
-#         f"Document name: {file_name}\n"
-#         f"Extract the securities terms from the document text below.\n"
-#         f"Use one row/object per security/class/series.\n\n"
-#         f"DOCUMENT TEXT:\n{evidence}"
-#     )
-#     response = client.responses.create(
-#         model=model,
-#         instructions=INSTRUCTIONS,
-#         input=[{"role": "user", "content": [{"type": "input_text", "text": user_text}]}],
-#         text=_text_format_schema(),
-#     )
-#     return _response_to_json(response)
-
-
 
 def _load_dictionary_phrases(dictionary_path: Path) -> Dict[str, List[str]]:
     """Load phrase dictionary from Excel. Sheet name = category."""
@@ -1458,6 +1742,54 @@ def _quality_review_via_file_api(
             pass
 
 
+def _oip_price_review_via_file_api(
+    client, model: str, file_name: str, file_bytes: bytes, current_data: Dict[str, Any],
+    reasoning_effort: str = "medium", max_output_tokens: int = 8000,
+) -> Dict[str, Any]:
+    """Dedicated source-document OIP validation pass, ported from
+    oip_price_review_with_file_api() in extract_articles.py."""
+    securities = current_data.get("securities", []) or []
+    security_list = [str(sec.get("security_name", "")) for sec in securities if str(sec.get("security_name", "")).strip()]
+    if not security_list:
+        return current_data
+
+    import io as _io
+    uploaded = client.files.create(
+        file=(file_name, _io.BytesIO(file_bytes)),
+        purpose="user_data",
+    )
+    user_text = (
+        f"Document name: {file_name}\n\n"
+        f"Expected securities/classes/series from prior extraction:\n"
+        f"{json.dumps(security_list, ensure_ascii=False, indent=2)}\n\n"
+        f"Prior extraction JSON for context:\n{json.dumps(current_data, ensure_ascii=False)}\n\n"
+        "Extract exact OIP / Original Issue Price values only from the uploaded source file. "
+        "Use page images if the PDF is scanned. Return strict JSON only."
+    )
+    try:
+        kwargs: Dict[str, Any] = dict(
+            model=model,
+            instructions=OIP_PRICE_REVIEW_INSTRUCTIONS,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": uploaded.id},
+                    {"type": "input_text", "text": user_text},
+                ],
+            }],
+            text=_oip_text_format_schema(),
+            reasoning={"effort": reasoning_effort} if reasoning_effort else None,
+            max_output_tokens=max_output_tokens,
+        )
+        response = client.responses.create(**kwargs)
+        oip_json = _response_to_json(response)
+        return _apply_oip_prices_to_data(current_data, oip_json)
+    finally:
+        try:
+            client.files.delete(uploaded.id)
+        except Exception:
+            pass
+
 def _seniority_waterfall_review_via_file_api(
     client,
     model: str,
@@ -1475,6 +1807,12 @@ def _seniority_waterfall_review_via_file_api(
     this pass is explicitly meant to read the document "like a human reviewer would",
     including scanned/image-based PDFs, so local extracted text is not used here.
     """
+
+    current_data = _oip_price_review_via_file_api(
+        client, model, file_name, file_bytes, current_data,
+        reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens,
+    )
+
     securities = current_data.get("securities", []) or []
     security_list = [str(sec.get("security_name", "")) for sec in securities if str(sec.get("security_name", "")).strip()]
     if not security_list:
@@ -1516,70 +1854,6 @@ def _seniority_waterfall_review_via_file_api(
             client.files.delete(uploaded.id)
         except Exception:
             pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-# def run_extraction(
-#     file_name: str,
-#     file_bytes: bytes,
-#     *,
-#     model: str,
-#     api_key: str,
-#     max_chars: int = 120_000,
-#     quality_pass: bool = False,
-#     seniority_pass: bool = True,
-# ) -> Dict[str, Any]:
-#     """
-#     Main entry point called from the Django view.
-
-#     Returns the raw OpenAI JSON:
-#     {
-#         "company_name": "...",
-#         "document_name": "...",
-#         "securities": [ {...}, ... ]
-#     }
-#     Raises RuntimeError on failure.
-
-#     seniority_pass: when True (default), runs the dedicated seniority-waterfall
-#     pass (SENIORITY_WATERFALL_INSTRUCTIONS) against the full uploaded file after
-#     the main extraction, and overwrites each security's seniority / source_basis /
-#     source_text / review_flags using _apply_seniority_tiers_to_data — matching the
-#     "Dedicated exact seniority extraction" rows seen in the original script's Excel
-#     output. Requires the file type to be supported by the file-api.
-#     """
-#     from openai import OpenAI
-#     client = OpenAI(api_key=api_key)
-
-#     suffix = Path(file_name).suffix.lower()
-#     LOCAL_TEXT_EXTS = {".pdf", ".docx", ".txt", ".md"}
-#     FILE_API_EXTS   = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".txt", ".md"}
-
-#     # ── Try local-text first (cheaper) ──────────────────────────────────────
-#     data: Optional[Dict[str, Any]] = None
-
-#     if suffix in LOCAL_TEXT_EXTS:
-#         try:
-#             if suffix == ".pdf":
-#                 text = _extract_pdf_text(file_bytes)
-#             elif suffix == ".docx":
-#                 text = _extract_docx_text(file_bytes)
-#             else:
-#                 text = file_bytes.decode("utf-8", errors="replace")
-
-#             text = _normalize_whitespace(text)
-
-#             if len(text.strip()) >= 1500:
-#                 data = _extract_via_local_text(
-#                     client, model, file_name, text, max_chars
-#                 )
-#                 # If nothing was extracted, fall through to file-api
-#                 if not (data.get("securities") or []):
-#                     data = None
-#         except Exception:
-#             data = None  # fall through to file-api
 
 def run_extraction(
     file_name: str,
@@ -1657,6 +1931,20 @@ def run_extraction(
             reasoning_effort=quality_reasoning_effort,
             max_output_tokens=max_output_tokens,
         )
+    source_document_text = ""
+    try:
+        if suffix == ".pdf":
+            source_document_text = _extract_pdf_text(file_bytes)
+        elif suffix == ".docx":
+            source_document_text = _extract_docx_text(file_bytes)
+        elif suffix in {".txt", ".md"}:
+            source_document_text = _normalize_whitespace(file_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        source_document_text = ""
+
+    data["securities"] = _validate_securities_against_source_text(
+        data.get("securities") or [], source_document_text
+    )
 
     print(f"[ArticleExtractor] Extraction complete. Securities found: {len(data.get('securities') or [])}")
     data = _apply_conversion_ratio_normalization(data)
