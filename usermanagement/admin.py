@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import UserActivity, WorkflowFeedback, ClientMaster
+from .models import ClientProjectSession, UserActivity, WorkflowFeedback, ClientMaster
 
 
 @admin.register(UserActivity)
@@ -161,3 +161,10 @@ class ClientMasterAdmin(admin.ModelAdmin):
             )
         }),
     )
+    
+admin.register(ClientProjectSession)
+class ClientProjectSessionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'client_name', 'project_name', 'created_at')
+    list_filter = ('created_at',)
+    search_fields = ('user__username', 'client_name', 'project_name')
+    readonly_fields = ('created_at',)

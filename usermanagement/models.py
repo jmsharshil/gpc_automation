@@ -139,3 +139,20 @@ class ClientMaster(models.Model):
 
     def __str__(self):
         return self.name
+    
+class ClientProjectSession(models.Model):
+    """
+    Stores the client and project submitted by a user at login.
+    The primary key (id) of this model is used as a session ID to track workflow activities.
+    """
+ 
+    user = models.ForeignKey('user_auth.User', on_delete=models.CASCADE, related_name='client_sessions')
+    client_name = models.CharField(max_length=512)
+    project_name = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+ 
+    def __str__(self):
+        return f"Session {self.id} — {self.client_name} / {self.project_name}"

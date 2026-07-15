@@ -1,5 +1,5 @@
 from django.shortcuts import render
-from .models import UserActivity, WorkflowFeedback , ClientMaster
+from .models import ClientProjectSession, UserActivity, WorkflowFeedback , ClientMaster
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from .permissions import IsAdminUser
@@ -111,29 +111,43 @@ class AdminPanelView(APIView):
     # CREATE ACTIVITY
     # ============================================================
     def post(self, request):
-
+ 
         user = request.user
-
         workflow = request.data.get('workflow', '').strip()
-
-        valid = [c[0] for c in UserActivity.WORKFLOW_CHOICES]
-
-        if workflow not in valid:
-            return Response(
-                {'error': f'workflow must be one of: {valid}'},
-                status=400,
-            )
-
-        UserActivity.objects.create(
+        session_id = request.data.get('session_id')
+        client_name = request.data.get('client_name', '').strip()
+        project_name = request.data.get('project_name', '').strip()
+ 
+        # Check if session_id is provided, map it to client and project
+        if session_id:
+            try:
+                session = ClientProjectSession.objects.get(id=session_id, user=user)
+                client_name = session.client_name
+                project_name = session.project_name
+            except ClientProjectSession.DoesNotExist:
+                return Response({'error': 'Invalid session_id'}, status=400)
+ 
+        if workflow:
+            valid = [c[0] for c in UserActivity.WORKFLOW_CHOICES]
+            if workflow not in valid:
+                return Response(
+                    {'error': f'workflow must be one of: {valid}'},
+                    status=400,
+                )
+ 
+        activity, created = UserActivity.objects.get_or_create(
             user=user,
             workflow=workflow,
-            project_name=request.data.get('project_name', ''),
-            client_name=request.data.get('client_name', ''),
+            project_name=project_name,
+            client_name=client_name,
         )
-
+ 
         return Response({
             'status': 'success',
-            'message': 'Activity created successfully'
+            'message': 'Activity created successfully',
+            'session_id': session_id,
+            'client_name': client_name,
+            'project_name': project_name,
         })
   
 class WorkflowFeedbackView(APIView):
@@ -255,6 +269,33 @@ class WorkflowFeedbackView(APIView):
             'workflow': workflow,
             'rating': rating,
             'feedback': feedback_text,
+        })
+        
+class ClientProjectSessionView(APIView):
+ 
+    permission_classes = [IsAuthenticated]
+ 
+    def post(self, request):
+        client_name = request.data.get('client_name', '').strip()
+        project_name = request.data.get('project_name', '').strip()
+ 
+        if not client_name:
+            return Response(
+                {'error': 'client_name is required'},
+                status=400
+            )
+ 
+        session = ClientProjectSession.objects.create(
+            user=request.user,
+            client_name=client_name,
+            project_name=project_name
+        )
+ 
+        return Response({
+            'status': 'session_created',
+            'session_id': session.id,
+            'client_name': session.client_name,
+            'project_name': session.project_name,
         })
         
 class AdminAnalyticsView(APIView):
