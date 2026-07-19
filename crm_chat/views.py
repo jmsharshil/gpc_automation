@@ -1906,7 +1906,6 @@ class UpdateGlobalOpenAISettingsAPIView(APIView):
 
     def post(self, request):
         update_data = {}
-
         fields = [
             "default_model",
             "temperature",
@@ -1914,7 +1913,6 @@ class UpdateGlobalOpenAISettingsAPIView(APIView):
             "use_rag_for_documents",
             "max_context_chunks",
         ]
-
         for field in fields:
             if field in request.data:
                 update_data[field] = request.data[field]
@@ -1925,10 +1923,24 @@ class UpdateGlobalOpenAISettingsAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        User = get_user_model()
+        existing_user_ids = set(
+            UserOpenAISetting.objects.values_list('user_id', flat=True)
+        )
+        missing_users = list(User.objects.exclude(id__in=existing_user_ids))
+        backfilled_count = len(missing_users)
+
+        if missing_users:
+            UserOpenAISetting.objects.bulk_create(
+                [UserOpenAISetting(user=u) for u in missing_users],
+                ignore_conflicts=True,
+            )
+
         updated = UserOpenAISetting.objects.update(**update_data)
 
         return Response({
             "success": True,
             "updated_users": updated,
-            "updated_fields": update_data
+            "updated_fields": update_data,
+            "backfilled_users": backfilled_count,
         })

@@ -47,6 +47,8 @@
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 class Chat(models.Model):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="chats")
@@ -146,3 +148,8 @@ class UserOpenAISetting(models.Model):
 
     def __str__(self):
         return f"OpenAI settings for {self.user}"
+    
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
+def create_user_openai_setting(sender, instance, created, **kwargs):
+    if created:
+        UserOpenAISetting.objects.get_or_create(user=instance)
