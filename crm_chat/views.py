@@ -803,7 +803,7 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
         await sync_to_async(doc_processing.save)()
  
         # Update chat
-        chat.has_document = True
+        chat.has_document = len(chunks) > 0
         await sync_to_async(chat.save)()
         # logger.info(
         #     "Completed PDF processing for chat_id=%s total_pages=%s total_chunks=%s",
@@ -1297,6 +1297,7 @@ class StreamingChatAPIView(APIView):
 
         user_text = request.data.get('content', '').strip()
         attachments = request.FILES.getlist('attachment')
+        auto_generated_prompt = False
 
         first_attachment = attachments[0] if attachments else None
 
@@ -1334,7 +1335,7 @@ class StreamingChatAPIView(APIView):
                         continue
 
                     file_bytes = attachment.read()
-
+                    attachment.seek(0)
                     Message.objects.create(
                         chat=chat,
                         role='user',
@@ -1355,15 +1356,9 @@ class StreamingChatAPIView(APIView):
                                 )
                                 future.result()    
                     else :
-                        chat.is_processing_document = True
-                        chat.save(update_fields=['is_processing_document'])
-
-                        thread = threading.Thread(
-                            target=_process_attachment_in_background,
-                            args=(chat.pk, file_bytes, name),
-                            daemon=True,
-                        )
-                        thread.start()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(_run_pdf_processing, chat, file_bytes, name)
+                            future.result()
 
                     queued_files.append(name)
 
@@ -1378,25 +1373,40 @@ class StreamingChatAPIView(APIView):
                     )
 
                 if not user_text:
-                    if queued_files:
-                        completion_msg = Message.objects.create(
+                    chat.refresh_from_db(fields=['has_document'])
+
+                    if queued_files and chat.has_document:
+                        # Processing already finished synchronously above (that's why this
+                        # request took a while) — post a status message, then keep going
+                        # so we generate a real answer instead of stopping here.
+                        Message.objects.create(
                             chat=chat,
                             role='assistant',
                             content=(
-                                f"⏳ Processing {len(queued_files)} file(s)... "
-                                f"this may take a minute for large files.\n\n"
+                                f"✅ {len(queued_files)} file(s) processed.\n\n"
                                 + "\n".join(queued_files)
                             ),
                         )
-                    else:
-                        completion_msg = Message.objects.create(
-                            chat=chat,
-                            role='assistant',
-                            content="⚠️ No valid files to process.",
+                        user_text = (
+                            "The document has been uploaded and processed. Give a brief "
+                            "summary of its key contents and confirm you're ready to "
+                            "answer questions about it."
                         )
-
-                    serializer = MessageSerializer(completion_msg, context={'request': request})
-                    return Response(serializer.data, status=status.HTTP_201_CREATED)
+                        auto_generated_prompt = True
+                    else:
+                        # Nothing usable came out of processing — no point calling the
+                        # model, since there's nothing to answer about.
+                        reason = (
+                            "⚠️ No valid files to process."
+                            if not queued_files else
+                            "⚠️ No extractable text was found in the uploaded file(s), so "
+                            "I don't have any document content to answer from."
+                        )
+                        completion_msg = Message.objects.create(
+                            chat=chat, role='assistant', content=reason,
+                        )
+                        serializer = MessageSerializer(completion_msg, context={'request': request})
+                        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
             except Exception as e:
                 error_msg = Message.objects.create(
@@ -1422,10 +1432,11 @@ class StreamingChatAPIView(APIView):
                 attachment=first_attachment if first_attachment else None,
                 attachment_name=attachment_name,
                 attachment_content_type=attachment_content_type,
+                metadata={'auto_generated': True} if auto_generated_prompt else {},
             )
 
         # 🔒 NEW: refuse to answer while document is still being processed
-            chat.refresh_from_db(fields=['is_processing_document', 'has_document'])
+        chat.refresh_from_db(fields=['is_processing_document', 'has_document'])
         if chat.is_processing_document:
             wait_msg = Message.objects.create(
                 chat=chat,

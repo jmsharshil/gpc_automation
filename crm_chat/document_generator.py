@@ -11,6 +11,7 @@ import re
 import uuid
 import logging
 from django.conf import settings
+from reportlab.platypus import Spacer
 
 logger = logging.getLogger(__name__)
 
