@@ -632,6 +632,7 @@ import sys
 from django.http import StreamingHttpResponse
 import time
 import concurrent.futures
+from .document_generator import parse_docgen_marker, generate_document_file, DOCGEN_PATTERN
 
 
 # logging.basicConfig(
@@ -687,32 +688,16 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
     Returns: Number of chunks created
     """
     doc_processing = None
+    doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
+        chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
+    )
     try:
-        # logger.info(
-        #     "Starting PDF processing for chat_id=%s pdf_bytes=%s",
-        #     chat.id,
-        #     len(file_bytes) if file_bytes is not None else 0,
-        # )
- 
         # Extract text — async parallel OCR for image-based pages
         pages_text = await extract_text_from_uploaded_file_async(file_name, file_bytes)
  
         page_text_lengths = [len(text or "") for text in pages_text.values()]
-        # logger.info(
-        #     "Extracted PDF text for chat_id=%s pages=%s non_empty_pages=%s total_chars=%s",
-        #     chat.id,
-        #     len(pages_text),
-        #     sum(1 for length in page_text_lengths if length > 0),
-        #     sum(page_text_lengths),
-        # )
- 
+    
         # Create chunks
-        # logger.info(
-        #     "Creating chunks for chat_id=%s chunk_size=%s overlap=%s",
-        #     chat.id,
-        #     1000,
-        #     200,
-        # )
         chunks = split_into_chunks(pages_text)
         # if chunks:
         #     logger.info(
@@ -734,14 +719,8 @@ async def process_pdf_for_rag(chat: Chat, file_bytes: bytes, file_name: str) -> 
         #     logger.warning("No chunks were created for chat_id=%s", chat.id)
  
         # Update document processing status
-        doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
-            chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
-        )
-        # logger.info(
-        #     "DocumentProcessing ready for chat_id=%s processing_id=%s status=%s",
-        #     chat.id,
-        #     doc_processing.id,
-        #     doc_processing.status,
+        # doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
+        #     chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
         # )
         doc_processing.total_pages = len(pages_text)
         await sync_to_async(doc_processing.save)()
@@ -1052,6 +1031,7 @@ class SendMessageAPIView(APIView):
                         serializer.data,
                         status=status.HTTP_201_CREATED
                     )
+                chat.refresh_from_db()
 
             except Exception as e:
 
@@ -1243,7 +1223,27 @@ import threading
 import concurrent.futures  # keep import if used elsewhere; not used below anymore
 from django.db import close_old_connections
 
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 20MB — adjust as needed
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB — adjust as needed
+
+# ====================== DOCUMENT GENERATION PROMPT ======================
+DOCGEN_SYSTEM_PROMPT = """
+---
+DOCUMENT GENERATION CAPABILITY:
+When the user asks you to generate/create/make a document (PDF, Word/DOCX, PowerPoint/PPTX, Excel/XLSX, or CSV), you MUST:
+1. Generate the full, detailed content for the document.
+2. At the VERY END of your response, output a special marker in EXACTLY this format (on its own line):
+
+$$DOCGEN{"format":"pdf","title":"My Document Title"}$$
+
+Supported formats: pdf, docx, pptx, xlsx, csv
+
+3. The content BEFORE the $$DOCGEN block is the document body. Write it in clean, well-structured text/markdown.
+4. NEVER refuse to generate documents. You ARE capable of creating documents — the backend will convert your text into the actual file.
+5. For CSV/Excel: output the data as a markdown table (using | col1 | col2 | format) BEFORE the $$DOCGEN block.
+6. For PPTX: separate slides with "---SLIDE---" markers, with the first line of each slide being the slide title.
+7. Do NOT wrap the $$DOCGEN marker in code blocks or backticks. It must be raw text.
+---
+"""
 
 
 def _process_attachment_in_background(chat_id, file_bytes, attachment_name):
@@ -1345,15 +1345,25 @@ class StreamingChatAPIView(APIView):
                     )
 
                     # mark chat as processing BEFORE starting the thread
-                    chat.is_processing_document = True
-                    chat.save(update_fields=['is_processing_document'])
+                    if user_text:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                                future = executor.submit(
+                                    _run_pdf_processing,
+                                    chat,
+                                    file_bytes,
+                                    name
+                                )
+                                future.result()    
+                    else :
+                        chat.is_processing_document = True
+                        chat.save(update_fields=['is_processing_document'])
 
-                    thread = threading.Thread(
-                        target=_process_attachment_in_background,
-                        args=(chat.pk, file_bytes, name),
-                        daemon=True,
-                    )
-                    thread.start()
+                        thread = threading.Thread(
+                            target=_process_attachment_in_background,
+                            args=(chat.pk, file_bytes, name),
+                            daemon=True,
+                        )
+                        thread.start()
 
                     queued_files.append(name)
 
@@ -1415,7 +1425,7 @@ class StreamingChatAPIView(APIView):
             )
 
         # 🔒 NEW: refuse to answer while document is still being processed
-            chat.refresh_from_db(fields=['is_processing_document'])
+            chat.refresh_from_db(fields=['is_processing_document', 'has_document'])
         if chat.is_processing_document:
             wait_msg = Message.objects.create(
                 chat=chat,
@@ -1434,10 +1444,12 @@ class StreamingChatAPIView(APIView):
 
         # --- Build messages_payload with RAG ---
         system_prompt = chat.system_prompt or ""
+        # Auto-inject document generation capability instructions
+        augmented_system_prompt = system_prompt + DOCGEN_SYSTEM_PROMPT
         messages_payload = []
 
-        if system_prompt:
-            messages_payload.append({'role': 'system', 'content': system_prompt})
+        if augmented_system_prompt.strip():
+            messages_payload.append({'role': 'system', 'content': augmented_system_prompt})
 
         # RAG context
         if chat.has_document:
@@ -1489,7 +1501,7 @@ class StreamingChatAPIView(APIView):
             model, temperature, max_tokens,
         )
 
-        # --- SSE generator (UNCHANGED) ---
+        # --- SSE generator with document generation support ---
         def event_stream():
             full_text = []
             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
@@ -1511,11 +1523,62 @@ class StreamingChatAPIView(APIView):
                             yield f"data: {escaped}\n\n"
 
                 assistant_text = "".join(full_text)
+
+                # --- Check for $$DOCGEN{...}$$ marker ---
+                body_text, docgen_config = parse_docgen_marker(assistant_text)
+
+                download_link = None
+                if body_text is not None and docgen_config:
+                    try:
+                        doc_format = docgen_config.get('format', 'pdf')
+                        doc_title = docgen_config.get('title', 'Document')
+
+                        relative_path, filename = generate_document_file(
+                            body_text, doc_format, doc_title
+                        )
+
+                        # Build the download URL
+                        media_url = getattr(settings, 'MEDIA_URL', '/media/')
+                        download_url = f"{media_url}{relative_path}"
+
+                        download_link = (
+                            f"\n\n📄 **Your {doc_format.upper()} document is ready!** "
+                            f"[⬇ Download {filename}]({download_url})"
+                        )
+
+                        # Stream the download link to the client
+                        escaped_link = download_link.replace('\n', '\\n')
+                        yield f"data: {escaped_link}\n\n"
+
+                        logger.info(
+                            "Document generated for chat_id=%s: %s (%s)",
+                            chat.id, filename, doc_format,
+                        )
+
+                    except Exception as e:
+                        logger.exception(
+                            "Document generation failed for chat_id=%s: %s",
+                            chat.id, e,
+                        )
+                        error_note = f"\n\n⚠️ Document generation failed: {str(e)}"
+                        escaped_err = error_note.replace('\n', '\\n')
+                        yield f"data: {escaped_err}\n\n"
+
+                # Save the assistant message
+                # Remove the raw $$DOCGEN$$ marker from saved content
+                saved_content = assistant_text
+                if download_link:
+                    saved_content = DOCGEN_PATTERN.sub('', saved_content).strip()
+                    saved_content += download_link
+
                 Message.objects.create(
                     chat=chat,
                     role='assistant',
-                    content=assistant_text,
-                    metadata={'streaming': True},
+                    content=saved_content,
+                    metadata={
+                        'streaming': True,
+                        'document_generated': bool(download_link),
+                    },
                 )
 
             except Exception as e:
@@ -1534,8 +1597,10 @@ class StreamingChatAPIView(APIView):
         response['Cache-Control'] = 'no-cache'
         response['X-Accel-Buffering'] = 'no'
         return response
+
     
 class EditAndResendAPIView(APIView):
+
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -1806,33 +1871,53 @@ class ClearChatSessionAPIView(APIView):
 class UpdateGlobalOpenAISettingsAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    def post(self, request):
-    
-        default_model = request.data.get("default_model")
-        temperature = request.data.get("temperature")
-        max_tokens = request.data.get("max_tokens")
+    def get(self, request):
+        """
+        Returns the current global OpenAI settings.
+        Assumes all users have the same settings.
+        """
+        setting = UserOpenAISetting.objects.first()
 
-        update_fields = {}
-
-        if default_model is not None:
-            update_fields["default_model"] = default_model
-
-        if temperature is not None:
-            update_fields["temperature"] = temperature
-
-        if max_tokens is not None:
-            update_fields["max_tokens"] = max_tokens
-
-        if not update_fields:
+        if not setting:
             return Response(
-                {"detail": "No fields provided."},
+                {"detail": "No OpenAI settings found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        return Response({
+            "default_model": setting.default_model,
+            "temperature": setting.temperature,
+            "max_tokens": setting.max_tokens,
+            "use_rag_for_documents": setting.use_rag_for_documents,
+            "max_context_chunks": setting.max_context_chunks,
+            "total_users": UserOpenAISetting.objects.count()
+        })
+
+    def post(self, request):
+        update_data = {}
+
+        fields = [
+            "default_model",
+            "temperature",
+            "max_tokens",
+            "use_rag_for_documents",
+            "max_context_chunks",
+        ]
+
+        for field in fields:
+            if field in request.data:
+                update_data[field] = request.data[field]
+
+        if not update_data:
+            return Response(
+                {"detail": "No fields supplied."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        updated_count = UserOpenAISetting.objects.update(**update_fields)
+        updated = UserOpenAISetting.objects.update(**update_data)
 
         return Response({
-            "message": "Global settings updated successfully.",
-            "updated_users": updated_count,
-            "settings": update_fields
+            "success": True,
+            "updated_users": updated,
+            "updated_fields": update_data
         })
