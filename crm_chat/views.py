@@ -1522,7 +1522,7 @@ class StreamingChatAPIView(APIView):
                     model=model,
                     messages=messages_payload,
                     temperature=temperature,
-                    max_tokens=max_tokens,
+                    max_completion_tokens=max_tokens,  # user max_tokens only while using gpt 4
                     stream=True,
                 ) as stream:
                     for chunk in stream:
