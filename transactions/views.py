@@ -114,28 +114,25 @@ class DashboardSummaryAPIView(APIView):
 
         return Response(data)
     
-class GeographyListAPIView(APIView):
-    """
-    Returns all unique geographies.
-    """
+class CountryListAPIView(APIView):
 
     def get(self, request):
-        geographies = (
+        countries = (
             Transaction.objects
-            .exclude(geography__isnull=True)
-            .exclude(geography__exact="")
-            .values_list("geography", flat=True)
+            .exclude(country__isnull=True)
+            .exclude(country__exact="")
+            .values_list("country", flat=True)
             .distinct()
-            .order_by("geography")
+            .order_by("country")
         )
 
         return Response(
             {
-                "count": len(geographies),
-                "results": list(geographies)
+                "count": len(countries),
+                "results": list(countries)
             },
             status=status.HTTP_200_OK
-        )    
+        ) 
     
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200

@@ -18,6 +18,7 @@ class Transaction(models.Model):
     ma_closed_date = models.DateField(null=True, blank=True)
 
     geography = models.CharField(max_length=512, null=True, blank=True)
+    country = models.CharField(max_length=512, null=True, blank=True)
 
     ev_revenue = models.DecimalField(max_digits=20, decimal_places=6, null=True, blank=True)
     ev_ebitda = models.DecimalField(max_digits=20, decimal_places=6, null=True, blank=True)

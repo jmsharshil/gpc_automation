@@ -89,7 +89,8 @@ def process_transaction_excel(file, uploaded_by=None, save_file_to_job=False):
                 ma_closed_date=to_date(safe_get(row_dict, "M&A Closed Date")),
 
                 geography=safe_get(row_dict, "Geographic Locations [Target/Issuer]"),
-
+                country=safe_get(row_dict, "Geography"),
+                
                 ev_revenue=to_decimal(
                     safe_get(row_dict, "Implied Enterprise Value/Revenues (x)")
                 ),
