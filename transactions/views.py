@@ -117,22 +117,44 @@ class DashboardSummaryAPIView(APIView):
 class CountryListAPIView(APIView):
 
     def get(self, request):
-        countries = (
+        countries = list(
             Transaction.objects
             .exclude(country__isnull=True)
             .exclude(country__exact="")
             .values_list("country", flat=True)
             .distinct()
-            .order_by("country")
         )
+
+        # Desired order
+        preferred_order = [
+            "United States of America",
+            "Canada",
+            "Australia",
+            "United Kingdom",
+            "Others",
+        ]
+
+        ordered_countries = []
+
+        # Add countries in preferred order
+        for country in preferred_order:
+            if country in countries:
+                ordered_countries.append(country)
+
+        # Add any remaining countries alphabetically
+        remaining = sorted(
+            [country for country in countries if country not in preferred_order]
+        )
+
+        ordered_countries.extend(remaining)
 
         return Response(
             {
-                "count": len(countries),
-                "results": list(countries)
+                "count": len(ordered_countries),
+                "results": ordered_countries
             },
             status=status.HTTP_200_OK
-        ) 
+        )
     
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200
