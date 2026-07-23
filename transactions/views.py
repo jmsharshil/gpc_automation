@@ -155,6 +155,26 @@ class CountryListAPIView(APIView):
             },
             status=status.HTTP_200_OK
         )
+
+class DashboardCountryListAPIView(APIView):
+
+    def get(self, request):
+        countries = list(
+            Transaction.objects
+            .exclude(country__isnull=True)
+            .exclude(country__exact="")
+            .values("country")
+            .annotate(count=Count("country"))
+            .order_by("-count", "country")  # Highest count first
+        )
+
+        return Response(
+            {
+                "count": len(countries),
+                "results": countries,
+            },
+            status=status.HTTP_200_OK,
+        )
     
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 200

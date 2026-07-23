@@ -457,7 +457,7 @@ class AskQuestionAPIView(APIView):
                 model=ai_model,
                 messages=messages_payload,
                 temperature=ai_temp,
-                max_tokens=ai_max_tokens,
+                max_completion_tokens=ai_max_tokens,
             )
             assistant_text = resp.choices[0].message.content or ""
             tokens_used = resp.usage.total_tokens if resp.usage else None
@@ -541,7 +541,7 @@ class AskQuestionStreamAPIView(APIView):
                     model=ai_model,
                     messages=messages_payload,
                     temperature=ai_temp,
-                    max_tokens=ai_max_tokens,
+                    max_completion_tokens=ai_max_tokens,
                     stream=True,
                 ) as stream:
                     for chunk in stream:
@@ -647,7 +647,7 @@ class EditMessageAPIView(APIView):
                 model=ai_model,
                 messages=messages_payload,
                 temperature=ai_temp,
-                max_tokens=ai_max_tokens,
+                max_completion_tokens=ai_max_tokens,
             )
             assistant_text = resp.choices[0].message.content or ""
             tokens_used = resp.usage.total_tokens if resp.usage else None
