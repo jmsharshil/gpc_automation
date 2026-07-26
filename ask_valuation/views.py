@@ -40,7 +40,7 @@ DEFAULT_MAX_CONTEXT_CHUNKS = 20
 # Helpers
 # ─────────────────────────────────────────────
 
-def _get_openai_settings(user):
+def _get_openai_settings():
     """Return (model, temperature, max_tokens, max_context_chunks) from ValuationOpenAISetting."""
     try:
         s = ValuationOpenAISetting.load()
