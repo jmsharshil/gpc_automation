@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Guide, GuideChunk, ValuationSession, ValuationMessage
+from .models import Guide, GuideChunk, ValuationOpenAISetting, ValuationSession, ValuationMessage
 
 @admin.register(Guide)
 class GuideAdmin(admin.ModelAdmin):
@@ -40,3 +40,14 @@ class ValuationMessageAdmin(admin.ModelAdmin):
     def short_content(self, obj):
         return obj.content[:80] + ("…" if len(obj.content) > 80 else "")
     short_content.short_description = "Content"
+    
+@admin.register(ValuationOpenAISetting)
+class ValuationOpenAISettingAdmin(admin.ModelAdmin):
+
+    list_display = ("default_model", "temperature", "max_tokens", "use_rag_for_documents", "max_context_chunks", "updated_at",)
+
+    def has_add_permission(self, request):
+        return not ValuationOpenAISetting.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False

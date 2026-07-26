@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Guide, GuideChunk, ValuationSession, ValuationMessage
+from .models import Guide, GuideChunk, ValuationOpenAISetting, ValuationSession, ValuationMessage
 
 class GuideSerializer(serializers.ModelSerializer):
     pdf_url = serializers.SerializerMethodField()
@@ -113,4 +113,8 @@ class ValuationSessionListSerializer(serializers.ModelSerializer):
     def get_message_count(self, obj):
         return obj.messages.count()
     
-    
+class ValuationOpenAISettingSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ValuationOpenAISetting
+        fields = "__all__"

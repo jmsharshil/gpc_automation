@@ -124,7 +124,27 @@ class ValuationMessage(models.Model):
     def __str__(self):
         return f"[{self.session}] {self.role}: {self.content[:60]}"
     
+class ValuationOpenAISetting(models.Model):
+    
+    default_model = models.CharField(max_length=100, default="gpt-4.1")
+    temperature = models.FloatField(default=0.3)
+    max_tokens = models.IntegerField(default=15000)
+    use_rag_for_documents = models.BooleanField(default=True)
+    max_context_chunks = models.IntegerField(default=20)
+    updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        verbose_name = "Valuation OpenAI Setting"
+        verbose_name_plural = "Valuation OpenAI Setting"
 
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
 
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
 
+    def __str__(self):
+        return "Valuation OpenAI Setting"

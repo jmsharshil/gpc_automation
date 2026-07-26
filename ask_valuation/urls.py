@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import (GuideListCreateAPIView, GuideDetailAPIView, GuideReprocessAPIView,ValuationSessionListCreateAPIView, ValuationSessionDetailAPIView,ValuationMessageListAPIView, AskQuestionAPIView,AskQuestionStreamAPIView, EditMessageAPIView, UpdateSessionGuidesAPIView,DeleteSessionAPIView, DeleteGuideAPIView, OpenGuideChatAPIView, ClearSessionAPIView)
+from .views import (GuideListCreateAPIView, GuideDetailAPIView, GuideReprocessAPIView, ValuationOpenAISettingAPIView,ValuationSessionListCreateAPIView, ValuationSessionDetailAPIView,ValuationMessageListAPIView, AskQuestionAPIView,AskQuestionStreamAPIView, EditMessageAPIView, UpdateSessionGuidesAPIView,DeleteSessionAPIView, DeleteGuideAPIView, OpenGuideChatAPIView, ClearSessionAPIView)
 
 urlpatterns = [
     # ── Guides ──────────────────────────────────────────
@@ -25,4 +25,5 @@ urlpatterns = [
     path('guide-chat/open/', OpenGuideChatAPIView.as_view(), name='open-guide-chat'),  
     path('chats/<int:pk>/clear/', ClearSessionAPIView.as_view(), name='session-clear'),
     
+    path("admin/openai-settings/", ValuationOpenAISettingAPIView.as_view(), name="valuation-openai-settings",),
 ]

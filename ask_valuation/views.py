@@ -17,6 +17,7 @@ from .models import Guide, ValuationSession, ValuationMessage
 from .serializers import (
     GuideSerializer,
     GuideListSerializer,
+    ValuationOpenAISettingSerializer,
     ValuationSessionSerializer,
     ValuationSessionListSerializer,
     ValuationMessageSerializer,
@@ -25,7 +26,7 @@ from .rag_utils import (
     process_guide_pdf,
     get_relevant_chunks_for_guides,
 )
-from crm_chat.models import UserOpenAISetting
+from .models import ValuationOpenAISetting
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +41,16 @@ DEFAULT_MAX_CONTEXT_CHUNKS = 20
 # ─────────────────────────────────────────────
 
 def _get_openai_settings(user):
-    """Return (model, temperature, max_tokens, max_context_chunks) from UserOpenAISetting."""
+    """Return (model, temperature, max_tokens, max_context_chunks) from ValuationOpenAISetting."""
     try:
-        s = UserOpenAISetting.objects.get(user=user)
+        s = ValuationOpenAISetting.load()
         return (
             s.default_model or DEFAULT_MODEL,
             float(s.temperature) if s.temperature is not None else DEFAULT_TEMPERATURE,
             int(s.max_tokens) if s.max_tokens else DEFAULT_MAX_TOKENS,
             int(s.max_context_chunks) if s.max_context_chunks else DEFAULT_MAX_CONTEXT_CHUNKS,
         )
-    except UserOpenAISetting.DoesNotExist:
+    except ValuationOpenAISetting.DoesNotExist:
         return DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_MAX_CONTEXT_CHUNKS
 
 
@@ -436,7 +437,7 @@ class AskQuestionAPIView(APIView):
         )
 
         # Resolve user OpenAI settings
-        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings(request.user)
+        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings()
 
         # Build RAG context
         context_parts, sources = [], []
@@ -516,7 +517,7 @@ class AskQuestionStreamAPIView(APIView):
         )
 
         # Resolve user OpenAI settings (before RAG, consistent with non-streaming path)
-        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings(request.user)
+        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings()
 
         # Build RAG context using the resolved max_chunks (was using default previously)
         context_parts, sources = [], []
@@ -625,7 +626,7 @@ class EditMessageAPIView(APIView):
             )
 
         # Re-run RAG + re-answer
-        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings(request.user)
+        ai_model, ai_temp, ai_max_tokens, ai_max_chunks = _get_openai_settings()
 
         context_parts, sources = [], []
         try:
@@ -842,3 +843,25 @@ class ClearSessionAPIView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+        
+class ValuationOpenAISettingAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]   # or IsAdminUser
+
+    def get(self, request):
+        config = ValuationOpenAISetting.load()
+        serializer = ValuationOpenAISettingSerializer(config)
+        return Response(serializer.data)
+
+    def patch(self, request):
+        config = ValuationOpenAISetting.load()
+
+        serializer = ValuationOpenAISettingSerializer(
+            config,
+            data=request.data,
+            partial=True
+        )
+
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(serializer.data)
