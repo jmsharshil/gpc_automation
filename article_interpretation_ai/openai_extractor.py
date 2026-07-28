@@ -455,6 +455,15 @@ def _normalize_whitespace(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+def _safe_upload_filename(file_name: str) -> str:
+    """The OpenAI file API can reject uppercase extensions like .PDF even
+    though .pdf is supported. Lowercase just the extension, not the stem."""
+    p = Path(file_name)
+    suffix = p.suffix
+    if suffix and suffix != suffix.lower():
+        return p.stem + suffix.lower()
+    return file_name
+
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
     from PyPDF2 import PdfReader
@@ -1069,11 +1078,11 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             return "NA"
         if any(x in low for x in ["non-participating", "non participating", "nonparticipating", "non-participating preferred"]):
             if any(x in low for x in ["greater", "deemed conversion", "as-converted", "as converted"]):
-                return "Non-participating / greater-of"
+                return "Non-participating"
             return "Non-participating"
         if any(x in low for x in ["deemed conversion", "as-converted", "as converted", "greater of"]):
             if re.search(r"remaining\s+(assets|proceeds|funds).{0,120}common", low, re.I):
-                return "Non-participating / greater-of"
+                return "Non-participating "
         if "capped" in low or "participation cap" in low:
             return "Capped Participation"
         if "full participation" in low:
@@ -1106,12 +1115,17 @@ def _build_cap_table(securities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return fallback
  
     def dividend_payable(row: Dict[str, Any]) -> str:
-        text = raw(row.get("dividend_paying"))
-        combined = f"{text} {raw(row.get('dividend_type'))} {raw(row.get('dividend_rate'))}".lower()
-        if any(x in combined for x in ["yes", "payable", "shall accrue", "shall be paid", "when, as and if declared", "when as and if declared"]):
+        dtype = _normalize_dividend_type(
+            row.get("dividend_type"),
+            " ".join([raw(row.get("dividend_paying")), raw(row.get("dividend_rate")), raw(row.get("source_text"))]),
+            missing_as="NA",
+        )
+        if dtype.startswith("Cumulative"):
             return "Yes"
-        if re.search(r"\b(no|not entitled|none|n/a|na)\b", combined):
+        if dtype == "Non-cumulative":
             return "No"
+        if dtype in {"NA", "N/A", "Not stated", ""}:
+            return "NA"
         return "NA"
  
     def dividend_rate_pct(row: Dict[str, Any]) -> str:
@@ -1665,7 +1679,7 @@ def _extract_via_file_api(
 ) -> Dict[str, Any]:
     import io as _io
     uploaded = client.files.create(
-        file=(file_name, _io.BytesIO(file_bytes)),
+        file=(_safe_upload_filename(file_name), _io.BytesIO(file_bytes)),
         purpose="user_data",
     )
     user_text = (
@@ -1709,7 +1723,7 @@ def _quality_review_via_file_api(
 ) -> Dict[str, Any]:
     import io as _io
     uploaded = client.files.create(
-        file=(file_name, _io.BytesIO(file_bytes)),
+        file=(_safe_upload_filename(file_name), _io.BytesIO(file_bytes)),
         purpose="user_data",
     )
     user_text = (
@@ -1755,7 +1769,7 @@ def _oip_price_review_via_file_api(
 
     import io as _io
     uploaded = client.files.create(
-        file=(file_name, _io.BytesIO(file_bytes)),
+        file=(_safe_upload_filename(file_name), _io.BytesIO(file_bytes)),
         purpose="user_data",
     )
     user_text = (
@@ -1820,7 +1834,7 @@ def _seniority_waterfall_review_via_file_api(
 
     import io as _io
     uploaded = client.files.create(
-        file=(file_name, _io.BytesIO(file_bytes)),
+        file=(_safe_upload_filename(file_name), _io.BytesIO(file_bytes)),
         purpose="user_data",
     )
     user_text = (
@@ -1946,7 +1960,28 @@ def run_extraction(
         data.get("securities") or [], source_document_text
     )
 
+    for sec in (data.get("securities") or []):
+        sec["authorized_count"] = _normalize_authorized_count(
+            sec.get("authorized_count", "Not stated"), missing_as="Not stated"
+        )
+        dividend_context = " ".join([
+            str(sec.get("dividend_paying", "")),
+            str(sec.get("dividend_rate", "")),
+            str(sec.get("source_text", "")),
+        ])
+        sec["dividend_type"] = _normalize_dividend_type(
+            sec.get("dividend_type", "Not stated"), dividend_context, missing_as="Not stated"
+        )
+        rate_context = " ".join([
+            str(sec.get("dividend_paying", "")),
+            str(sec.get("dividend_type", "")),
+            str(sec.get("source_text", "")),
+        ])
+        sec["dividend_rate"] = _normalize_dividend_rate_percent(
+            sec.get("dividend_rate", "Not stated"), rate_context, missing_as="Not stated"
+        )
+
     print(f"[ArticleExtractor] Extraction complete. Securities found: {len(data.get('securities') or [])}")
-    data = _apply_conversion_ratio_normalization(data)
+    # data = _apply_conversion_ratio_normalization(data)
     data["cap_table"] = _build_cap_table(data.get("securities") or [])
     return data
