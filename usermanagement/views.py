@@ -14,6 +14,8 @@ from django.db.models.functions import (
 from django.utils.dateparse import parse_date
 from django.db.models import Count, Avg
 from .serializers import ClientMasterSerializer
+from django.utils import timezone
+from datetime import timedelta
 
 class AdminTrackingPagination(PageNumberPagination):
     page_size = 20
@@ -121,7 +123,19 @@ class AdminPanelView(APIView):
         # Check if session_id is provided, map it to client and project
         if session_id:
             try:
-                session = ClientProjectSession.objects.get(id=session_id, user=user)
+                session = ClientProjectSession.objects.filter(
+                    id=session_id,
+                    user=user,
+                    is_active=True,
+                    expires_at__gt=timezone.now()
+                ).first()
+                if not session:
+                    return Response(
+                        {
+                            "error": "PROJECT_SESSION_EXPIRED"
+                        },
+                        status=403
+                    )
                 client_name = session.client_name
                 project_name = session.project_name
             except ClientProjectSession.DoesNotExist:
@@ -138,8 +152,11 @@ class AdminPanelView(APIView):
         activity, created = UserActivity.objects.get_or_create(
             user=user,
             workflow=workflow,
-            project_name=project_name,
-            client_name=client_name,
+            project_session=session,
+            defaults={
+                "client_name": session.client_name,
+                "project_name": session.project_name,
+            }
         )
  
         return Response({
@@ -285,10 +302,17 @@ class ClientProjectSessionView(APIView):
                 status=400
             )
  
+        ClientProjectSession.objects.filter(
+            user=request.user,
+            is_active=True
+        ).update(is_active=False)
+
         session = ClientProjectSession.objects.create(
             user=request.user,
             client_name=client_name,
-            project_name=project_name
+            project_name=project_name,
+            expires_at=timezone.now() + timedelta(hours=1),
+            is_active=True
         )
  
         return Response({
@@ -296,6 +320,33 @@ class ClientProjectSessionView(APIView):
             'session_id': session.id,
             'client_name': session.client_name,
             'project_name': session.project_name,
+        })
+    def get(self, request):
+
+        session = ClientProjectSession.objects.filter(
+            user=request.user,
+            is_active=True
+        ).order_by("-created_at").first()
+
+        if not session:
+            return Response({
+                "expired": True
+            })
+
+        if session.expires_at <= timezone.now():
+
+            session.is_active = False
+            session.save()
+
+            return Response({
+                "expired": True
+            })
+
+        return Response({
+            "expired": False,
+            "session_id": session.id,
+            "client_name": session.client_name,
+            "project_name": session.project_name
         })
         
 class AdminAnalyticsView(APIView):

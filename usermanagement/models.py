@@ -2,6 +2,26 @@ from django.db import models
 from django.db import models
 from django.conf import settings
 # Create your models here.
+
+class ClientProjectSession(models.Model):
+    """
+    Stores the client and project submitted by a user at login.
+    The primary key (id) of this model is used as a session ID to track workflow activities.
+    """
+ 
+    user = models.ForeignKey('user_auth.User', on_delete=models.CASCADE, related_name='client_sessions')
+    client_name = models.CharField(max_length=512)
+    project_name = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    
+    class Meta:
+        ordering = ['-created_at']
+ 
+    def __str__(self):
+        return f"Session {self.id} — {self.client_name} / {self.project_name}"
  
 class UserActivity(models.Model):
     """Records workflow usage with client/project details."""
@@ -38,6 +58,7 @@ class UserActivity(models.Model):
     )
 
     details = models.JSONField(default=dict, blank=True)
+    project_session = models.ForeignKey(ClientProjectSession,on_delete=models.CASCADE,related_name="activities",null=True,blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -140,19 +161,3 @@ class ClientMaster(models.Model):
     def __str__(self):
         return self.name
     
-class ClientProjectSession(models.Model):
-    """
-    Stores the client and project submitted by a user at login.
-    The primary key (id) of this model is used as a session ID to track workflow activities.
-    """
- 
-    user = models.ForeignKey('user_auth.User', on_delete=models.CASCADE, related_name='client_sessions')
-    client_name = models.CharField(max_length=512)
-    project_name = models.CharField(max_length=255)
-    created_at = models.DateTimeField(auto_now_add=True)
-    
-    class Meta:
-        ordering = ['-created_at']
- 
-    def __str__(self):
-        return f"Session {self.id} — {self.client_name} / {self.project_name}"
