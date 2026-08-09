@@ -200,7 +200,7 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                 total_revenue = _parse_decimal(row.get("Total Revenue [LTM] ($USDmm, Historical rate)"))
                 enterprise_value = _parse_decimal(row.get("Total Enterprise Value [My Setting] [Latest] ($USDmm, Historical rate)"))
                 ebitda = _parse_decimal(row.get("EBITDA [LTM] ($USDmm, Historical rate)"))
-                ev_revenu = _parse_decimal(row.get("EV/ Revenu"))
+                ev_revenu = _parse_decimal(row.get("EV/ Revenue"))
                 ev_ebitda = _parse_decimal(row.get("EV/ EBITDA"))
                 
                 # NEW: read/parse first pricing date
