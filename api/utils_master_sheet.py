@@ -47,6 +47,48 @@ def _parse_decimal(val):
         except Exception:
             return None
 
+def _parse_valuation_multiple(val):
+    """
+    Parse EV/Revenue and EV/EBITDA values.
+
+    Rules:
+    - "-" / "—" / blank / NA -> None
+    - numeric 0 -> None
+    - valid numeric value -> Decimal
+    """
+    if pd.isna(val):
+        return None
+
+    s = str(val).strip()
+
+    if not s:
+        return None
+
+    # Excel/text dash means no meaningful multiple
+    if s.lower() in EMPTY_TOKENS:
+        return None
+
+    # Remove common formatting
+    s = s.replace(',', '').replace('$', '').replace(' ', '')
+
+    if s.startswith('(') and s.endswith(')'):
+        s = '-' + s[1:-1]
+
+    try:
+        value = Decimal(s)
+    except (InvalidOperation, ValueError):
+        s2 = s.replace('%', '')
+        try:
+            value = Decimal(s2)
+        except Exception:
+            return None
+
+    # Excel may internally provide 0 even when the cell displays "-"
+    if value == Decimal('0'):
+        return None
+
+    return value
+
 
 def _truncate_for_model(model_cls, attr_name, value):
     """
@@ -201,7 +243,7 @@ def process_master_screening_v2(uploaded_file, update_snapshot=False, uploaded_b
                 enterprise_value = _parse_decimal(row.get("Total Enterprise Value [My Setting] [Latest] ($USDmm, Historical rate)"))
                 ebitda = _parse_decimal(row.get("EBITDA [LTM] ($USDmm, Historical rate)"))
                 ev_revenu = _parse_decimal(row.get("EV/ Revenue"))
-                ev_ebitda = _parse_decimal(row.get("EV/ EBITDA"))
+                ev_ebitda = _parse_valuation_multiple(row.get("EV/ EBITDA"))
                 
                 # NEW: read/parse first pricing date
                 first_pricing_date_raw = row.get("First Pricing Date")
