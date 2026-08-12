@@ -15,6 +15,8 @@ from django.http import StreamingHttpResponse
 import hashlib
 import logging
 import numpy as np
+from datetime import datetime
+
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -37,8 +39,9 @@ class UploadExcelView(APIView):
 
             required_columns = [
                 "S.NO",
-                "TYPE",
+                "Type",
                 "Classification",
+                "Date (mm/yyyy)",
                 "Project",
                 "Auditor",
                 "Questions",
@@ -50,12 +53,29 @@ class UploadExcelView(APIView):
                 if col not in df.columns:
                     return Response({"error": f"Missing column: {col}"}, status=status.HTTP_400_BAD_REQUEST)
 
+            df["Date (mm/yyyy)"] = pd.to_datetime(
+                df["Date (mm/yyyy)"],
+                format="%m/%Y",
+                errors="coerce"
+            )
+
             records = []
             for _, row in df.iterrows():
+                
+                excel_date = row.get("Date (mm/yyyy)")
+
+                # Convert pandas Timestamp -> Python date
+                # Convert NaT/blank -> None
+                if pd.isna(excel_date):
+                    record_date = None
+                else:
+                    record_date = excel_date.date()
+                
                 record = AuditRecord(
                     serial_no=row.get("S.NO"),
-                    type=row.get("TYPE"),
+                    type=row.get("Type"),
                     classification=row.get("Classification"),
+                    date=record_date,
                     project=row.get("Project"),
                     auditor=row.get("Auditor"),
                     question=row.get("Questions"),
@@ -298,7 +318,7 @@ def search_db_records(query_embedding: list, query_text: str) -> dict:
         )
         .values(
             "question_embedding", "response_embedding",
-            "serial_no", "type", "project", "auditor", "question", "response",
+            "serial_no", "type", "date", "project", "auditor", "question", "response",
         )
     )
 
@@ -393,6 +413,7 @@ def search_db_records(query_embedding: list, query_text: str) -> dict:
                 "serial_no": sno,
                 "type":      r["type"],
                 "project":   r["project"],
+                "date":      r["date"],
                 "auditor":   r["auditor"],
                 "question":  r["question"],
                 "response":  r["response"],
@@ -587,6 +608,8 @@ class FilterRecordsView(APIView):
         types           = request.GET.get("type")
         classifications = request.GET.get("classification")
         auditors        = request.GET.get("auditor")
+        from_date       = request.GET.get("from_date")
+        to_date         = request.GET.get("to_date")
  
         if types:
             queryset = queryset.filter(type__in=[t.strip() for t in types.split(",")])
@@ -594,10 +617,49 @@ class FilterRecordsView(APIView):
             queryset = queryset.filter(classification__in=[c.strip() for c in classifications.split(",")])
         if auditors:
             queryset = queryset.filter(auditor__in=[a.strip() for a in auditors.split(",")])
- 
+
+        # Date range filter
+        if from_date:
+            try:
+                from_date_obj = datetime.strptime(
+                    from_date,
+                    "%m/%Y"
+                ).date()
+
+                queryset = queryset.filter(
+                    date__gte=from_date_obj
+                )
+
+            except ValueError:
+                return Response(
+                    {
+                        "error": "Invalid from_date format. Use MM/YYYY."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if to_date:
+            try:
+                to_date_obj = datetime.strptime(
+                    to_date,
+                    "%m/%Y"
+                ).date()
+
+                queryset = queryset.filter(
+                    date__lte=to_date_obj
+                )
+
+            except ValueError:
+                return Response(
+                    {
+                        "error": "Invalid to_date format. Use MM/YYYY."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
         return Response({
             "total_count": queryset.count(),
-            "results": list(queryset.values("id", "type", "classification", "project", "auditor", "question", "response"))
+            "results": list(queryset.values("id", "type", "classification", "date","project", "auditor", "question", "response"))
         })
  
  
@@ -732,6 +794,7 @@ class RunAIScreenStreamView(APIView):
                             "s_no":     match["serial_no"],
                             "type":     match["type"],
                             "project":  match["project"],
+                            "date":     match["date"].strftime("%m/%Y") if match["date"] else None,
                             "auditor":  match["auditor"],
                             "question": match["question"],
                             "answer":   match["response"],
@@ -750,6 +813,7 @@ class RunAIScreenStreamView(APIView):
                 if deduped_matches:
                     db_context_for_prompt = "\n\n".join(
                         f"S.No {m['serial_no']} | Score: {m['score']:.2f}\n"
+                        f"Date: {m['date']} | "
                         f"Q: {m['question']}\n"
                         f"A: {m['response']}"
                         for m in deduped_matches[:10]   # cap at 10 for prompt size

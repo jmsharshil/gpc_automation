@@ -10,6 +10,7 @@ class AuditRecord(models.Model):
     auditor = models.CharField(max_length=255)
     question = models.TextField()
     response = models.TextField()
+    date = models.DateField(null=True, blank=True)
 
     # Pre-stored embedding — computed once, reused on every query (no N API calls)
     question_embedding = models.JSONField(null=True, blank=True)
