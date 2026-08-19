@@ -77,7 +77,7 @@ class Message(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     metadata = models.JSONField(default=dict, blank=True)
     
-    attachment = models.FileField(upload_to='chat_attachments/%Y/%m/%d/', null=True, blank=True)
+    attachment = models.FileField(upload_to='chat_attachments/%Y/%m/%d/', max_length=1000, null=True, blank=True)
     attachment_name = models.CharField(max_length=512, blank=True)
     attachment_content_type = models.CharField(max_length=255, blank=True)
 
