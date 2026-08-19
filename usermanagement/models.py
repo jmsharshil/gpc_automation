@@ -32,6 +32,7 @@ class UserActivity(models.Model):
         ('audit_ai', 'Audit AI'),
         ('ask_ai', 'Ask AI'),
         ('article_interpretation_ai', 'Article Interpretation AI'),
+        ('ask_valuation_guide', 'Ask Valuation Guide'),
     )
 
     user = models.ForeignKey(
@@ -88,6 +89,7 @@ class WorkflowFeedback(models.Model):
         ('audit_ai', 'Audit AI'),
         ('ask_ai', 'Ask AI'),
         ('article_interpretation_ai', 'Article Interpretation AI'),
+        ('ask_valuation_guide', 'Ask Valuation Guide'),
     )
 
     RATING_CHOICES = (
