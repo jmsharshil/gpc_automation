@@ -71,7 +71,7 @@ class ValuationSession(models.Model):
         on_delete=models.CASCADE,
         related_name='valuation_sessions',
     )
-    title = models.CharField(max_length=255, blank=True)
+    title = models.TextField(blank=True)
     system_prompt = models.TextField(blank=True)
     selected_guides = models.ManyToManyField(
         Guide,
