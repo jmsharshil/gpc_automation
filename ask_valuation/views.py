@@ -27,6 +27,7 @@ from .rag_utils import (
     get_relevant_chunks_for_guides,
 )
 from .models import ValuationOpenAISetting
+from django.db.models import Count
 
 logger = logging.getLogger(__name__)
 
@@ -354,10 +355,17 @@ class ValuationSessionListCreateAPIView(generics.ListCreateAPIView):
         return ValuationSessionSerializer
 
     def get_queryset(self):
-        return ValuationSession.objects.filter(
+        qs = ValuationSession.objects.filter(
             owner=self.request.user
         ).prefetch_related("selected_guides")
-
+ 
+        session_type = self.request.query_params.get("type")
+        if session_type == "multi":
+            qs = qs.annotate(guide_count=Count('selected_guides')).filter(guide_count__gt=1)
+        elif session_type == "single":
+            qs = qs.annotate(guide_count=Count('selected_guides')).filter(guide_count__lte=1)
+           
+        return qs
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)
 
