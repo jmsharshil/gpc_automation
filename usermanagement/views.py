@@ -151,11 +151,11 @@ class AdminPanelView(APIView):
  
         activity, created = UserActivity.objects.get_or_create(
             user=user,
-            client_name=session.client_name,
-            project_name=session.project_name,
+            workflow=workflow,
+            project_session=session,
             defaults={
-                "workflow": workflow,
-                "project_session": session
+                "client_name": session.client_name,
+                "project_name": session.project_name,
             }
         )
  
