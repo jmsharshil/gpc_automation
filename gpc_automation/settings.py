@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'usermanagement',
     'ask_valuation',
     'article_interpretation_ai',
+    'ask_ai_demo',
 ]
 
 REST_FRAMEWORK = {
@@ -309,3 +310,5 @@ MICROSOFT_GRAPH_USER_URL = "https://graph.microsoft.com/v1.0/me"
 
 # 🔥 THIS MUST POINT TO REDIRECT CALLBACK (NOT callback-json)
 MICROSOFT_OAUTH_REDIRECT_URI = "https://gpcauto-ezh4e7hcf8dzbpcy.centralindia-01.azurewebsites.net/auth/microsoft/callback/"
+
+AZURE_SANDBOX_START_URL = os.environ.get("AZURE_SANDBOX_URL")

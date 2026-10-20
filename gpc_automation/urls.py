@@ -30,6 +30,7 @@ urlpatterns = [
     path('api/v1/user/', include("usermanagement.urls")),
     path('api/v1/ask-valuation/', include("ask_valuation.urls")),
     path('api/v1/articles/', include("article_interpretation_ai.urls")),
+    path('api/v2/', include("ask_ai_demo.urls")),
     
     
 ]
