@@ -1,7 +1,7 @@
 """
 articles_app/openai_extractor.py  (single-file version)
 
-PART 1 (top of file): verbatim engine from extract_articles.py (v17_6_price_roles_and_conversion_ratios)
+PART 1 (top of file): verbatim engine from extract_articles.py (v17_8_dollar_lp_display)
 with ONLY the CLI / Excel / filesystem-output code removed. Prompts, schemas, verification
 passes and validators are unchanged and must keep their ORIGINAL ORDER (later definitions
 intentionally override / wrap earlier ones).
@@ -8018,6 +8018,193 @@ from its operative numerator and Conversion Price, including when both are equal
 CAP_TABLE_SOURCE_FACTS_INSTRUCTIONS += r'''
 Do not use annual dividend dollars as issue prices. Verify each series' initial
 conversion price from the conversion chapter and preserve its independent role.
+'''
+
+
+# ---------------------------------------------------------------------------
+# v17.7: Issue Price aliases, defined preference reductions, current conversion
+# prices and their dependent ratios. No document names or values are hardcoded.
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "v17_8_dollar_lp_display"
+
+
+def _v177_issue_price_definition(name: str, text: str) -> Optional[Tuple[float, str]]:
+    """Parse an exact share/price pair from a defined Issue Price list."""
+    t = _v175_text(text); rx = _v175_identity(name)
+    if not t or not rx:
+        return None
+    hits = []
+    for h in re.finditer(r'(?<!original )\bissue\s+price["\u201c\u201d]*\s+(?:means?|shall\s+mean)\b', t, re.I):
+        block = t[h.end():h.end()+2400]
+        # Restrict to the definition, not a later operative clause.
+        block = re.split(r'\.\s+(?=[A-Z])', block, maxsplit=1)[0]
+        pat = rf'with\s+respect\s+to\s+(?:the\s+)?{rx}\s*,\s*(?:US\s*)?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+        for hit in re.finditer(pat, block, re.I):
+            hits.append((float(hit.group(1).replace(',', '')), 'Issue Price definition: '+hit.group(0)))
+    return _v175_unique(hits)
+
+
+def _v177_current_conversion_price(name: str, text: str) -> Optional[Tuple[float, str]]:
+    """A stated price as of this charter outranks its historical initial price."""
+    t = _v175_text(text); rx = _v175_identity(name)
+    if not t or not rx:
+        return None
+    hits = []
+    for label in re.finditer(rf'["\u201c\u201d]*{rx}\s+conversion\s+price["\u201c\u201d]*\s+(?=was\b|is\b|shall\b)', t, re.I):
+        clause = t[label.end():label.end()+1000]
+        clause = re.split(r'\.\s+(?=[A-Z])', clause, maxsplit=1)[0]
+        pat = r'as\s+of\s+(?:the\s+)?(?:date\s+hereof|date\s+of\s+this\s+(?:certificate|charter))\s*,?\s*is\s*,?\s*(?:equal\s+to\s*)?(?:US\s*)?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+        for hit in re.finditer(pat, clause, re.I):
+            hits.append((float(hit.group(1).replace(',', '')), label.group(0)+clause))
+    return _v175_unique(hits)
+
+
+def _v177_original_issue_definition(name: str, text: str) -> Optional[Tuple[float, str]]:
+    t = _v175_text(text); rx = _v175_identity(name)
+    if not t or not rx:
+        return None
+    pat = rf'original\s+(?:issue|issuance|purchase)\s+price["\u201c\u201d]*\s+(?:of|for)\s+(?:the\s+)?{rx}\s+(?:shall\s+mean|means?|is)\s*(?:US\s*)?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)'
+    return _v175_unique([(float(h.group(1).replace(',', '')), h.group(0)) for h in re.finditer(pat, t, re.I)])
+
+
+_v177_previous_literal = _v175_literal
+
+
+def _v175_literal(name: str, text: str, role: str) -> Optional[Tuple[float, str]]:
+    if role == 'conversion':
+        current = _v177_current_conversion_price(name, text)
+        if current:
+            return current
+    if role == 'oip':
+        explicit = _v177_original_issue_definition(name, text) or _v177_issue_price_definition(name, text)
+        if explicit:
+            return explicit
+    return _v177_previous_literal(name, text, role)
+
+
+def _v177_issue_price_liquidation(name: str, text: str) -> Optional[str]:
+    """Explicit group liquidation right plus an exact Preferred Share price pair."""
+    t = _v175_text(text)
+    if not _v177_issue_price_definition(name, t):
+        return None
+    # The defined price is explicitly per named Preferred Share. Do not inherit
+    # a group preference into Ordinary/Common shares or unnamed residual classes.
+    if not re.search(r'\b(?:preferred|preference)\s+shares?\b', name, re.I):
+        return None
+    for h in re.finditer(r'\bliquidation\s+preference\s*\.', t, re.I):
+        chunk = t[h.end():h.end()+4000]
+        chunk = re.split(r'\(ii\)|\bconversion\b', chunk, maxsplit=1, flags=re.I)[0]
+        hit = re.search(r'holders\s+of\s+preferred\s+shares\s+shall\s+be\s+entitled\s+to\s+receive.{0,1000}?an\s+amount\s+equal\s+to\s+(?:the\s+)?applicable\s+issue\s+price\s*,?\s*plus\s+all\s+declared\s+but\s+unpaid\s+dividends', chunk, re.I)
+        if hit:
+            return hit.group(0)
+    return None
+
+
+def _v177_preference_reduction(name: str, text: str) -> Optional[str]:
+    """Resolve a Preference Amount used by the waterfall and its exact series."""
+    t = re.sub(r'(?<=\s)-{2,}(?=\s)', ' ', _v175_text(text)); rx = _v175_identity(name)
+    if not t or not rx:
+        return None
+    # The alias establishes which series is the recipient of the first tier.
+    alias = re.search(rf'references\s+to\s+["\u201c\u201d]*preferred\s+stock["\u201c\u201d]*\s+mean\s+(?:the\s+)?{rx}', t, re.I)
+    tier = re.search(r'first\s*,\s*to\s+the\s+holders\s+of\s+preferred\s+stock.{0,180}?until\s+the\s+preference\s+amount.{0,180}?is\s+zero', t, re.I)
+    definition = re.search(rf'["\u201c\u201d]*preference\s+amount["\u201c\u201d]*\s+shall\s+mean\s*,?\s*with\s+respect\s+to\s+(?:the\s+)?{rx}\s*,\s*an\s+amount\s+per\s+share\s+equal\s+to\s*\(i\)\s*(?:the\s+)?original\s+issue\s+price\s+per\s+share\s*,?\s*less\s*\(ii\)\s*(?:the\s+)?per\s+share\s+amount\s+of\s+any\s+dividends\s+previously\s+distributed\s+in\s+accordance\s+with\s+section\s+1', t, re.I)
+    if alias and tier and definition:
+        return alias.group(0)+'; '+tier.group(0)+'; '+definition.group(0)
+    return None
+
+
+def _v177_named_oip_conversion_formula(name: str, text: str) -> Optional[str]:
+    t = _v175_text(text); rx = _v175_identity(name)
+    if not t or not rx:
+        return None
+    hit = re.search(rf'dividing\s*(?:\(i\)\s*)?(?:the\s+)?original\s+issue\s+price\s+of\s+(?:the\s+)?{rx}\s+by\s*(?:\(ii\)\s*)?(?:the\s+)?{rx}\s+conversion\s+price', t, re.I)
+    return hit.group(0) if hit else None
+
+
+_v177_previous_final_locks = _v175_final_locks
+
+
+def _v175_final_locks(df: pd.DataFrame, source_document_text: str = '') -> pd.DataFrame:
+    out = _v177_previous_final_locks(df, source_document_text)
+    if out is None or out.empty:
+        return out
+    for idx, row in out.iterrows():
+        name = str(row.get('Security Name', '') or '')
+        if _v17_security_kind(name, str(row.get('Security Type', '') or '')) != 'preferred':
+            continue
+        # Use document text when available, otherwise original quoted evidence.
+        row_ev = str(row.get('Source Text', '') or '').split('\nV17.5 SOURCE CLAUSE CERTIFICATION:',1)[0]
+        text = source_document_text or row_ev
+        proof = []
+        lp = _v177_issue_price_liquidation(name, text)
+        if lp:
+            out.at[idx,'Liquidation Preference'] = '1x OIP + declared unpaid dividends'
+            proof.append('LP: '+lp)
+        reduction = _v177_preference_reduction(name, text)
+        if reduction:
+            # Prior distributions are absent from the charter. Do not invent zero
+            # prior dividends or present the original price as an unconditional LP.
+            out.at[idx,'Liquidation Preference'] = '1x OIP less prior dividends/share (floor $0)'
+            proof.append('LP reduction: '+reduction)
+        current = _v177_current_conversion_price(name, text)
+        formula = _v177_named_oip_conversion_formula(name, text)
+        if current:
+            out.at[idx,'Conversion Price'] = _fmt_money_num(current[0])
+            proof.append('Current CP: '+current[1])
+            base = _money_to_float(out.at[idx,'OIP / Original Issue Price'])
+            if formula and base is not None and current[0]>0:
+                ratio = Decimal(str(base))/Decimal(str(current[0]))
+                out.at[idx,'Conversion Ratio'] = '1:1' if abs(ratio-1)<=Decimal('1e-9') else format(ratio.quantize(Decimal('0.000001')), 'f').rstrip('0').rstrip('.')+':1'
+                proof.append('Ratio: '+formula)
+        if proof:
+            out.at[idx,'Review Flags'] = _append_review_flag(str(out.at[idx,'Review Flags'] or ''), 'v17.7 defined preference/current-price certification')
+            marker='\nV17.7 SOURCE CLAUSE CERTIFICATION:\n'
+            original=str(out.at[idx,'Source Text'] or '').split(marker,1)[0]
+            out.at[idx,'Source Text']=original+marker+'\n'.join(proof)
+    return out
+
+
+_v177_previous_summary = build_cap_table_summary
+
+
+def build_cap_table_summary(terms_df: pd.DataFrame) -> pd.DataFrame:
+    """Render base liquidation preferences in dollars; retain deductions in supporting terms."""
+    if terms_df is None or terms_df.empty:
+        return _v177_previous_summary(terms_df)
+    normalized = terms_df.copy()
+    if 'Liquidation Preference' in normalized.columns:
+        # Presentation alias only: this does not infer a missing liquidation right.
+        normalized['Liquidation Preference'] = normalized['Liquidation Preference'].apply(
+            lambda v: re.sub(r'(?i)\b(\d+(?:\.\d+)?)\s*x\s+(?:the\s+)?(?:applicable\s+)?issue\s+price\b', r'\1x OIP', str(v)) if v is not None else v)
+    result = _v177_previous_summary(normalized)
+    if result is None or result.empty:
+        return result
+    for _, row in normalized.iterrows():
+        liq = str(row.get('Liquidation Preference','') or '')
+        # Show the base principal as a dollar LP in the concise summary.
+        # The deduction remains explicit in Extracted Terms and source evidence;
+        # no assumption is made about the amount of dividends already distributed.
+        if re.fullmatch(r'1x OIP less prior dividends/share \(floor \$0\)', liq):
+            price = _money_to_float(row.get('OIP / Original Issue Price'))
+            if price is not None:
+                match = result['Series Name'].astype(str).eq(str(row.get('Security Name','')))
+                result.loc[match,'Liq. Pref. / Share'] = _fmt_money_num(price)
+    return result
+
+
+ECONOMIC_ANCHOR_INSTRUCTIONS += r'''
+Use the operative CURRENT Conversion Price where the charter states that an
+initial price was reduced and specifies a price as of its date. Preserve that
+current-price clause and recalculate the conversion ratio from its named formula.
+Issue Price is a valid defined economic base even without the word Original.
+Resolve Preference Amount cross-references in a distribution waterfall, including
+reductions for previously paid dividends. Never assume those prior payments are zero.
+'''
+CAP_TABLE_SOURCE_FACTS_INSTRUCTIONS += r'''
+For an explicit initial-to-current conversion price history, use the stated
+current price and keep OIP independent. Resolve a defined Preference Amount
+through its series definition and preserve reductions for prior distributions.
 '''
 
 
