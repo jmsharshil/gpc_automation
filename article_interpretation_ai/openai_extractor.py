@@ -2,6 +2,7 @@
 articles_app/openai_extractor.py  (single-file version)
 
 PART 1 (top of file): verbatim engine from extract_articles.py (v17_8_dollar_lp_display)
++ articles_waterfall_patch.py (v17_9_scoped_waterfall_patch) inserted at the end of the engine
 with ONLY the CLI / Excel / filesystem-output code removed. Prompts, schemas, verification
 passes and validators are unchanged and must keep their ORIGINAL ORDER (later definitions
 intentionally override / wrap earlier ones).
@@ -8209,7 +8210,214 @@ through its series definition and preserve reductions for prior distributions.
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PART 2 — Django adapter (everything above is the unchanged v17.2 engine)
+# PATCH v17.9 (articles_waterfall_patch.py) — inserted VERBATIM, once, at the end of the engine
+# part (the equivalent of 'immediately before if __name__ == "__main__"' in extract_articles.py).
+# Do not move it above any engine code, and do not insert it twice.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# PATCH ONLY -- append ONCE to extract_articles.py AFTER its existing definitions
+# and immediately BEFORE: if __name__ == "__main__":
+# Compatible with the October 19 v17.8 file. Do not run/import this file alone.
+# Reuses existing re/json/Decimal/pd/Path/OpenAI helpers; no new dependencies.
+# A scanned PDF needs ONE additional API request for verbatim economic clauses.
+
+SCRIPT_VERSION = "v17_9_scoped_waterfall_patch"
+
+# Requested reporting convention, NOT a claim that the charter expressly says
+# "non-cumulative". False preserves accrual classification for review instead.
+DECLARATION_DEPENDENT_DIVIDENDS_AS_NON_CUMULATIVE = True
+
+
+def _wf_section(text, number, heading):
+    text = re.sub(r"\s+", " ", str(text or ""))
+    start = re.search(rf"\b{re.escape(number)}\.?\s+{heading}", text, re.I)
+    if not start:
+        return ""
+    rest = text[start.end():]
+    # Heading words prevent cross-references inside sentences becoming boundaries.
+    end = re.search(r"\b(?:2\.\d+\.?\s+(?:Preferential Payments|Payments to Holders|Distribution of Remaining Assets|Valuation|Deemed Liquidation|Effecting)|[234]\.\s+(?:Liquidation|Voting|Optional Conversion|Conversion))", rest, re.I)
+    return text[start.start():start.end()] + (rest[:end.start()] if end else rest)
+
+
+def _wf_cap(residual):
+    # The aggregate of preference + residual sharing, NOT the initial preference.
+    if not re.search(r"maximum\s+participation\s+amount", residual, re.I):
+        return None
+    match = re.search(r"exceed\s+(?:the\s+product\s+of\s+)?(two|three|four|\d+(?:\.\d+)?)(?:\s*\(\s*\d+\s*\))?\s*(?:times|x)\s+(?:the\s+)?(?:applicable\s+)?original\s+(?:issue\s+)?price", residual, re.I)
+    if not match:
+        return None
+    token = match.group(1).lower()
+    return Decimal({"two": "2", "three": "3", "four": "4"}.get(token, token))
+
+
+def _wf_price(name, dividends, preference):
+    rx = _v175_identity(name)
+    if not rx:
+        return None
+    money = r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    definitions = []
+    # Named definitions, including Series One/Two/Three Original Issue Price.
+    for hit in re.finditer(rf'{rx}\s+original\s+issue\s+price["\u201c\u201d]*\s+shall\s+mean\s*{money}', dividends, re.I):
+        definitions.append(Decimal(hit.group(1).replace(',', '')))
+    # Enumerated OIP definition with shorter labels (e.g. Series A-3).
+    for heading in re.finditer(r'original\s+issue\s+price["\u201c\u201d]*\s+for\s*\(i\)', dividends, re.I):
+        block = dividends[heading.end():heading.end()+1500]
+        for hit in re.finditer(rf'{rx}\s+shall\s+mean\s*{money}', block, re.I):
+            definitions.append(Decimal(hit.group(1).replace(',', '')))
+    if definitions and len(set(definitions)) == 1:
+        return definitions[0]
+    # A fixed preference expressly defines the same named original issue price.
+    hit = re.search(rf'amount\s+per\s+share\s+equal\s+to\s*{money}\s+per\s+share\s*\(\s*(?:the\s+)?["\u201c\u201d]*{rx}\s+original\s+issue\s+price', preference, re.I)
+    return Decimal(hit.group(1).replace(',', '')) if hit else None
+
+
+def _wf_apply(df, source_text):
+    if df is None or df.empty:
+        return df
+    dividends = _wf_section(source_text, "1", r"Dividends\b")
+    preference = _wf_section(source_text, "2.1", r"(?:Preferential Payments|Payments to Holders)\b")
+    residual = _wf_section(source_text, "2.2", r"(?:Distribution of Remaining Assets|Payments to Holders)\b")
+    # Verify who receives the residual, excluding the earlier preference payment.
+    pool = re.search(r"remaining\s+assets.{0,600}?shall\s+be\s+distributed(.{0,600}?)pro\s+rata", residual, re.I)
+    shared = bool(pool and re.search(r"preferred\s+stock", pool.group(1), re.I) and re.search(r"common\s+stock", pool.group(1), re.I))
+    if not preference or not residual or not shared:
+        return df
+    cap = _wf_cap(residual)
+    # Absence of a parsed numeric cap alone never proves unrestricted sharing.
+    unrestricted = not re.search(r"maximum|participation\s+cap|ceiling|shall\s+(?:not\s+)?exceed|limited\s+to|subject\s+to", residual, re.I)
+    one_x = bool(re.search(r"amount\s+per\s+share\s+equal\s+to\s+(?:one\s+times\s+)?(?:the\s+)?applicable\s+original\s+issue\s+price", preference, re.I))
+    declared_only = (re.search(r"payable\s+only\s+when,?\s*as,?\s*and\s*if\s+declared", dividends, re.I)
+                     and re.search(r"under\s+no\s+obligation\s+to\s+pay", dividends, re.I)
+                     and re.search(r"plus\s+any\s+dividends\s+declared\s+but\s+unpaid", preference, re.I)
+                     and not re.search(r"accrued\s+(?:and|but)\s+unpaid\s+dividends", preference, re.I))
+    out = df.copy()
+    for idx, row in out.iterrows():
+        name = str(row.get("Security Name", ""))
+        if _v17_security_kind(name, str(row.get("Security Type", ""))) != "preferred":
+            continue
+        exact_price = _wf_price(name, dividends, preference)
+        # Exact per-series source definition proves membership in this group.
+        if exact_price is None:
+            continue
+        out.at[idx, "OIP / Original Issue Price"] = _fmt_money_num(exact_price)
+        if one_x or re.search(r"amount\s+per\s+share\s+equal\s+to\s*\$", preference, re.I):
+            out.at[idx, "Liquidation Preference"] = _fmt_money_num(exact_price)
+        if cap is not None:
+            out.at[idx, "Participation Rights"] = "Capped Participation"
+            out.at[idx, "Participation Cap"] = _fmt_money_num(exact_price * cap)
+        elif unrestricted:
+            out.at[idx, "Participation Rights"] = "Participating"
+            out.at[idx, "Participation Cap"] = ""
+        else:
+            continue  # Unresolved cap: retain prior classification for review.
+        flags = str(row.get("Review Flags", "") or "")
+        if re.search(r"non[- ]cumulative|shall\s+not\s+be\s+cumulative", dividends, re.I):
+            out.at[idx, "Dividend Type"] = "Non Cumulative"
+        if declared_only and DECLARATION_DEPENDENT_DIVIDENDS_AS_NON_CUMULATIVE:
+            out.at[idx, "Dividend Type"] = "Non Cumulative"
+            out.at[idx, "Dividend Paying"] = "When declared"
+            flags = _append_review_flag(flags, "Reporting convention: declaration-dependent accruing dividends displayed Non Cumulative; source accrual wording retained")
+        flags = _append_review_flag(flags, "v17.9 scoped-waterfall certification")
+        out.at[idx, "Review Flags"] = flags
+        marker = "\nV17.9 VERIFIED WATERFALL:\n"
+        prior = str(row.get("Source Text", "") or "").split(marker, 1)[0]
+        out.at[idx, "Source Text"] = prior + marker + dividends + "\n" + preference + "\n" + residual
+        # The cap covers the combined 2.1 + 2.2 distributions, including declared
+        # dividends in 2.1; the as-converted alternative is NOT an additional cap.
+        if cap is not None:
+            out.at[idx, "Source Text"] += "\nCAP PRICE INCLUDES DIVIDENDS: Yes"
+    return out
+
+
+_wf_previous_locks = _v175_final_locks
+
+
+def _v175_final_locks(df, source_document_text=""):
+    return _wf_apply(_wf_previous_locks(df, source_document_text), source_document_text)
+
+
+_wf_previous_summary = build_cap_table_summary
+
+
+def build_cap_table_summary(terms_df):
+    result = _wf_previous_summary(terms_df)
+    if result is None or result.empty:
+        return result
+    for _, row in terms_df.iterrows():
+        if "v17.9 scoped-waterfall certification" not in str(row.get("Review Flags", "")):
+            continue
+        match = result["Series Name"].astype(str).eq(str(row["Security Name"]))
+        for internal, external in [("Liquidation Preference", "Liq. Pref. / Share"),
+                                   ("Participation Rights", "Participation Rights"),
+                                   ("Participation Cap", "Participation Cap $ / Share"),
+                                   ("Dividend Type", "Dividend Type")]:
+            result.loc[match, external] = row[internal]
+        result.loc[match, "Cap price Includes Dividends"] = "Yes" if row["Participation Rights"] == "Capped Participation" else ""
+    return result
+
+
+# Scanned PDFs: preserve complete verbatim clauses for deterministic export.
+# Do not substitute sparse scan metadata or AI-calculated values for these clauses.
+def _wf_read_scan_clauses(client, model, path, keep_api_files=False):
+    fields = ["dividends", "prices", "preference", "residual"]
+    schema = {"type": "object", "properties": {f: {"type": "string"} for f in fields},
+              "required": fields, "additionalProperties": False}
+    upload_path, is_temp = prepare_api_upload_path(path)
+    uploaded = None
+    try:
+        with upload_path.open("rb") as stream:
+            uploaded = client.files.create(file=stream, purpose="user_data")
+        response = _responses_create(client, model=model,
+            instructions="Transcribe verbatim only. Read the full uploaded charter. Return the COMPLETE dividend clause in dividends; all original issue price definitions in prices; the COMPLETE first liquidation preference paragraph (2.1) in preference; and the COMPLETE residual distribution and participation-cap paragraph (2.2) in residual. Preserve exceptions, accrual/no-obligation wording, all recipients, numeric multipliers and as-converted alternatives. Empty string if absent. Do not infer or calculate terms.",
+            input=[{"role": "user", "content": [{"type": "input_file", "file_id": uploaded.id}]}],
+            text={"format": {"type": "json_schema", "name": "waterfall_verbatim_clauses", "strict": True, "schema": schema}})
+        facts = json.loads(response.output_text)
+        if any(not isinstance(facts.get(f), str) for f in fields):
+            raise ValueError("Invalid waterfall transcription; do not certify this document")
+        def labeled(number, title, body):
+            if re.match(rf"\s*{re.escape(number)}\.?\s+[A-Za-z]", body):
+                return body
+            return number + " " + title + " " + body
+        return (labeled("1", "Dividends.", facts["dividends"]) + " " + facts["prices"] +
+                "\n" + labeled("2.1", "Preferential Payments to Holders of Preferred Stock.", facts["preference"]) +
+                "\n" + labeled("2.2", "Distribution of Remaining Assets.", facts["residual"]) +
+                "\n2.3 Deemed Liquidation Events.")
+    finally:
+        if uploaded is not None and not keep_api_files:
+            try:
+                client.files.delete(uploaded.id)
+            except Exception:
+                pass
+        cleanup_api_upload_path(upload_path, is_temp)
+
+
+_wf_previous_process = process_file
+
+
+def process_file(client, model, path, *args, **kwargs):
+    result = _wf_previous_process(client, model, path, *args, **kwargs)
+    if result.status == "success" and Path(path).suffix.lower() == ".pdf":
+        native = extract_local_text(Path(path))
+        if not _v17_local_text_is_sufficient(Path(path), native):
+            keep = kwargs.get("keep_api_files", args[3] if len(args) > 3 else False)
+            result.data["_waterfall_source_text"] = _wf_read_scan_clauses(client, model, path, keep)
+    return result
+
+
+_wf_previous_source = source_document_text_from_raw_json
+
+
+def source_document_text_from_raw_json(raw_json):
+    items = raw_json or []
+    if len(items) == 1:
+        clauses = (items[0].get("data") or {}).get("_waterfall_source_text")
+        if clauses:
+            return _wf_previous_source(raw_json) + "\n" + clauses
+    return _wf_previous_source(raw_json)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 2 — Django adapter (everything above is the unchanged v17.8 engine + v17.9 patch)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────────────────────────────────────
