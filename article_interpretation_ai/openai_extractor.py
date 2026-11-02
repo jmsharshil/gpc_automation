@@ -3,6 +3,7 @@ articles_app/openai_extractor.py  (single-file version)
 
 PART 1 (top of file): verbatim engine from extract_articles.py (v17_8_dollar_lp_display)
 + articles_waterfall_patch.py (v17_9_scoped_waterfall_patch) inserted at the end of the engine
++ dividend_rate_patch.py (explicit named dividend % override) inserted after it
 with ONLY the CLI / Excel / filesystem-output code removed. Prompts, schemas, verification
 passes and validators are unchanged and must keep their ORIGINAL ORDER (later definitions
 intentionally override / wrap earlier ones).
@@ -8417,7 +8418,98 @@ def source_document_text_from_raw_json(raw_json):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PART 2 — Django adapter (everything above is the unchanged v17.8 engine + v17.9 patch)
+# PATCH 2 (dividend_rate_patch.py) — inserted VERBATIM, once, AFTER the v17.9 waterfall patch
+# and BEFORE the Django adapter. Do not move it above the v17.9 patch or any engine code,
+# and do not insert it twice. (SCRIPT_VERSION is intentionally unchanged by this patch.)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# CHANGED CODE BLOCKS ONLY -- append ONCE after ALL existing definitions/patches
+# and immediately BEFORE the final: if __name__ == "__main__":
+# Works with the October 19 code, with or without the October 29 waterfall patch.
+# Do not run this file separately. No new packages or additional API calls.
+
+
+def _dr_named_percentage(security_name, source_text):
+    """An explicit dividend percentage must belong to this named recipient."""
+    text = re.sub(r"\s+", " ", str(source_text or ""))
+    identity = _v175_identity(security_name)
+    if not identity:
+        return None
+    # Bind the rate to the receiving series list, rather than a nearby security
+    # mention, liquidation price, conversion price or OIP dollar amount.
+    recipient = r"\bholders\s+of\s+(?:shares\s+of\s+)?(?P<names>[^.;]{1,1600}?)\s+shall\s+be\s+entitled\s+to\s+receive\s+dividends\b"
+    candidates = {}
+    for match in re.finditer(recipient, text, re.I):
+        if not re.search(identity, match.group("names"), re.I):
+            continue
+        tail = text[match.end():match.end()+3500]
+        # Do not cross into the next sentence or another economic section.
+        tail = re.split(r"\.\s+(?=[A-Z])|\b\d+[.]\s*(?:Liquidation|Conversion|Redemption|Voting)\b", tail, maxsplit=1)[0]
+        rate_pattern = r"(?:per\s+share\s+)?rate\s+(?:per\s+annum\s+)?of\s+(?:[a-z]+\s+percent\s*\(\s*)?(\d+(?:\.\d+)?)\s*(?:%|percent\b|per\s*cent\b)"
+        for rate in re.finditer(rate_pattern, tail, re.I):
+            value = Decimal(rate.group(1))
+            if Decimal("0") <= value <= Decimal("100"):
+                candidates[value] = text[match.start():match.end()] + tail
+    # Ambiguous rates must not be assigned across series.
+    if len(candidates) != 1:
+        return None
+    value, evidence = next(iter(candidates.items()))
+    display = format(value.normalize(), "f") + "%"
+    return display, evidence
+
+
+def _dr_apply_explicit_rates(df, source_document_text=""):
+    if df is None or df.empty:
+        return df
+    result = df.copy()
+    for idx, row in result.iterrows():
+        name = str(row.get("Security Name", "") or "")
+        if _v17_security_kind(name, str(row.get("Security Type", "") or "")) != "preferred":
+            continue
+        # Actual source text has priority over model-returned snippets.
+        explicit = _dr_named_percentage(name, source_document_text)
+        if explicit is None:
+            explicit = _dr_named_percentage(name, row.get("Source Text", ""))
+        if explicit is None:
+            continue
+        rate, evidence = explicit
+        result.at[idx, "Dividend Rate"] = rate
+        result.at[idx, "Review Flags"] = _append_review_flag(
+            str(row.get("Review Flags", "") or ""),
+            "Explicit named dividend percentage certified")
+        marker = "\nEXPLICIT DIVIDEND RATE EVIDENCE:\n"
+        prior = str(row.get("Source Text", "") or "").split(marker, 1)[0]
+        result.at[idx, "Source Text"] = prior + marker + evidence
+    return result
+
+
+_dr_previous_final_locks = _v175_final_locks
+
+
+def _v175_final_locks(df, source_document_text=""):
+    # Run last: a calculated annual-dollar/OIP rate cannot override an explicit %.
+    validated = _dr_previous_final_locks(df, source_document_text)
+    return _dr_apply_explicit_rates(validated, source_document_text)
+
+
+_dr_previous_summary = build_cap_table_summary
+
+
+def build_cap_table_summary(terms_df):
+    certified = _dr_apply_explicit_rates(terms_df)
+    summary = _dr_previous_summary(certified)
+    if summary is None or summary.empty:
+        return summary
+    for _, row in certified.iterrows():
+        if "Explicit named dividend percentage certified" not in str(row.get("Review Flags", "")):
+            continue
+        match = summary["Series Name"].astype(str).eq(str(row["Security Name"]))
+        summary.loc[match, "Dividend Rate"] = row["Dividend Rate"]
+    return summary
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 2 — Django adapter (everything above is the unchanged v17.8 engine + v17.9 patch + dividend-rate patch)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────────────────────────────────────
