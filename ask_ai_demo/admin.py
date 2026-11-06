@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import ChatDemo, MessageDemo, UserOpenAISettingDemo, BusinessContextMemoryDemo, BusinessDocumentDemo, BusinessDocumentChunkDemo
+from .models import ChatDemo, MessageDemo, UserOpenAISettingDemo, BusinessContextMemoryDemo, BusinessDocumentDemo, BusinessDocumentChunkDemo,DocumentChunkDemo,DocumentProcessingDemo
 
 
 
@@ -45,3 +45,5 @@ class BusinessDocumentChunkAdmin(admin.ModelAdmin):
     search_fields = ('text',)
     list_filter = ('business_document',)
 
+admin.site.register(DocumentChunkDemo)
+admin.site.register(DocumentProcessingDemo)

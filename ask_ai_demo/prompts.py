@@ -98,54 +98,10 @@ INTENT_PROMPTS: dict[IntentLabel, str] = {
         "Do not use deprecated library functions."
     ),
     "document_generation": (
-        "Produce a complete, well-structured draft (headings, sections, formatting) "
-        "ready for the document rendering sandbox. Ask for missing details (audience, "
+        "The user wants a file. Build it with the run_python_code tool, then reply with "
+        "one short line summarising what you created. Ask for missing details (audience, "
         "length, tone, format) only if required to proceed. Keep surrounding commentary "
-        "to one line before/after the draft.\n\n"
-        "When generating documents via the run_python_code sandbox tool, follow these "
-        "STRICT rules — failure will cause a runtime error:\n"
-        "1. ALWAYS start your script with ALL necessary imports. Never assume anything "
-        "is pre-imported. For Excel/openpyxl scripts you MUST include:\n"
-        "   import openpyxl\n"
-        "   from openpyxl import Workbook\n"
-        "   from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side, "
-        "GradientFill, numbers)\n"
-        "   from openpyxl.utils import get_column_letter\n"
-        "   import pandas as pd\n"
-        "   import numpy as np\n"
-        "   import os, uuid\n"
-        "2. For PowerPoint scripts (python-pptx) always import:\n"
-        "   from pptx import Presentation\n"
-        "   from pptx.util import Inches, Pt, Emu\n"
-        "   from pptx.dml.color import RGBColor\n"
-        "   from pptx.enum.text import PP_ALIGN\n"
-        "3. For Word documents always import:\n"
-        "   from docx import Document\n"
-        "   from docx.shared import Pt, Inches, RGBColor\n"
-        "4. For PDF (reportlab) always import:\n"
-        "   from reportlab.lib.pagesizes import letter, A4\n"
-        "   from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph\n"
-        "   from reportlab.lib.styles import getSampleStyleSheet\n"
-        "   from reportlab.lib import colors\n"
-        "5. Save the deliverable ONLY in /tmp/outputs/ (inputs are read-only in /tmp/inputs).\n"
-        "6. Do NOT use deprecated numpy functions: numpy.irr, numpy.npv, numpy.pv. "
-        "Implement financial math manually using pure Python loops if needed.\n"
-        "7. Always use import random if generating random data.\n"
-        "8. Double-check every class or function name you use exists in the library "
-        "before using it.\n"
-        "9. For Excel: NEVER reference a variable before it is defined in the script. Every style "
-        "variable (e.g. header_fill, header_font, thin_border) MUST be assigned with a "
-        "full definition (e.g. header_fill = PatternFill(...)) BEFORE it is applied to "
-        "any cell. Do not use a variable name unless you explicitly assigned it in the "
-        "same script. If you apply the same style to many cells, define the style object "
-        "once at the top of the script, then reuse it.\n"
-        "10. For Excel: If you use custom styles like navy_fill or navy_font, you MUST define them: "
-        "navy_fill = PatternFill(fill_type='solid', fgColor='17365D') "
-        "navy_font = Font(name='Arial', size=10, bold=True, color='FFFFFF').\n"
-        "11. PREVENT TEXT OVERFLOW: Ensure all text fits within its container (shapes, tables, document margins). "
-        "For PPTX shapes, you MUST enable word wrap and auto-size to fit text by importing `from pptx.enum.text import MSO_AUTO_SIZE` "
-        "and setting `shape.text_frame.word_wrap = True` AND `shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE`. "
-        "Adjust widths/heights so that text does not overflow out of bounds."
+        "to one line."
     ),
     "financial_analysis": (
         "Structure the response as: (1) a direct, structured answer with headings/"
@@ -166,9 +122,22 @@ INTENT_PROMPTS: dict[IntentLabel, str] = {
 }
 
 
+TOOL_USAGE_NOTE: str = (
+    "You have two tools. Decide yourself whether a question needs either of them.\n"
+    "1) Web search: use it for current or time-sensitive facts (recent rates, laws and regulations, news, "
+    "prices, anything that may have changed after your training) or when the user asks you to look something up. "
+    "Do NOT search when the answer is in the document excerpts, the knowledge base or the conversation, or for "
+    "general knowledge, writing and analysis. Never put client or company names, personal data or figures taken "
+    "from the user's uploaded documents into a search query: search generic terms only. Cite the sources you used.\n"
+    "2) run_python_code: ONLY when the user asks you to create, convert or edit a file "
+    "(Excel, PowerPoint, Word, PDF, CSV).\n"
+    "For greetings, questions, explanations and analysis, answer in plain text and use no tool."
+)
+
+
 def build_system_prompt(intent: IntentLabel, rag_insufficient: bool = False) -> str:
-    """Compose the final system prompt = CORE + intent addendum + optional RAG warning."""
-    prompt = CORE_SYSTEM_PROMPT + "\n\n" + INTENT_PROMPTS[intent]
+    """Compose the final system prompt = CORE + intent addendum + tool note + optional RAG warning."""
+    prompt = CORE_SYSTEM_PROMPT + "\n\n" + INTENT_PROMPTS[intent] + "\n\n" + TOOL_USAGE_NOTE
     if rag_insufficient:
         prompt += RAG_INSUFFICIENT_PROMPT
     return prompt
@@ -179,6 +148,7 @@ def build_system_prompt(intent: IntentLabel, rag_insufficient: bool = False) -> 
 # ---------------------------------------------------------------------------
 
 # Classifier system prompt — kept minimal; the model returns a single word.
+# Classifier system prompt — strictly prioritizes current user request over chat history
 _CLASSIFIER_SYSTEM = (
     "You are a strict intent classifier and memory router. Given the user's latest message, recent chat history, "
     "and saved User Context Memory, perform two tasks:\n"
@@ -202,6 +172,7 @@ _CLASSIFIER_SYSTEM = (
     "Example: {\"intent\": \"general\", \"relevant_memory\": \"\"}"
 )
 
+
 def classify_intent(
     user_message: str,
     recent_history: list[dict] | None = None,
@@ -217,19 +188,19 @@ def classify_intent(
         (intent_label, relevant_memory_string)
     """
     clean_msg = (user_message or "").strip().lower().rstrip(".,;:!?")
- 
+
     # Fast heuristics for obvious greetings
     if clean_msg in {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "thanks", "thank you"}:
         return "general", ""
- 
+
     # Fast heuristics for pure explanation/inspection requests
     if clean_msg in {"explain this", "explain", "what is this", "what's this", "tell me about this", "describe this", "what does this mean", "summarize", "summarize this"}:
         return "general", ""
-    
+
     from django.conf import settings as django_settings
     from openai import OpenAI
     import json
- 
+
     try:
         key = api_key or getattr(django_settings, 'OPENAI_API_KEY', None)
         client = OpenAI(api_key=key)
@@ -267,7 +238,7 @@ def classify_intent(
 
     except Exception as exc:
         logger.error("Intent classification failed (%s); defaulting to 'general'.", exc)
-        return "general", context_memory
+        return "general", ""
 
 
 def get_intent_max_tokens(intent: IntentLabel, user_max_tokens: int) -> int:
