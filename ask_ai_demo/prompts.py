@@ -43,8 +43,8 @@ RAG_SIMILARITY_THRESHOLD: float = 0.30   # cosine similarity 0-1 scale
 INTENT_MAX_TOKENS: dict[IntentLabel, int] = {
     "code": 4000,
     "document_generation": 16000,
-    "financial_analysis": 6000,
-    "general": 2000,
+    "financial_analysis": 8000,
+    "general": 4000,
 }
 
 # ---------------------------------------------------------------------------
@@ -123,15 +123,20 @@ INTENT_PROMPTS: dict[IntentLabel, str] = {
 
 
 TOOL_USAGE_NOTE: str = (
-    "You have two tools. Decide yourself whether a question needs either of them.\n"
+    "You have two tools. Decide yourself whether a question needs either of them:\n"
     "1) Web search: use it for current or time-sensitive facts (recent rates, laws and regulations, news, "
     "prices, anything that may have changed after your training) or when the user asks you to look something up. "
     "Do NOT search when the answer is in the document excerpts, the knowledge base or the conversation, or for "
     "general knowledge, writing and analysis. Never put client or company names, personal data or figures taken "
     "from the user's uploaded documents into a search query: search generic terms only. Cite the sources you used.\n"
-    "2) run_python_code: ONLY when the user asks you to create, convert or edit a file "
-    "(Excel, PowerPoint, Word, PDF, CSV).\n"
-    "For greetings, questions, explanations and analysis, answer in plain text and use no tool."
+    "2) run_python_code: Use this tool to:\n"
+    "   - Create or edit a deliverable file ONLY when the user explicitly asks to generate, build, or download a file.\n"
+    "   - Inspect uploaded files in /tmp/inputs (PDF, Excel, CSV) to verify arithmetic, audit financial tables, "
+    "calculate exact sums, or check formula errors with Python (openpyxl, pandas, numpy, PyPDF2). "
+    "When inspecting or auditing, PRINT your findings to stdout using print() and present the complete analysis "
+    "directly in your chat response as clear, structured Markdown -- do NOT save an output file to /tmp/outputs/ "
+    "unless the user explicitly requested a file to download.\n"
+    "For simple text questions, explanations, and greetings, answer directly in plain text without tools."
 )
 
 
@@ -161,6 +166,7 @@ _CLASSIFIER_SYSTEM = (
     "CRITICAL CONSTRAINTS:\n"
     "  * If the user says 'hi', 'hello', 'hey', 'thanks', or any greeting, it is ALWAYS 'general'. NEVER 'document_generation'.\n"
     "  * If the user says 'explain this', 'what is this', 'summarize', 'help me understand', or asks questions about an uploaded image/document without requesting a new file, it is ALWAYS 'general' (or 'financial_analysis' if a finance question). NEVER 'document_generation'!\n"
+    "  * If the user asks to 'check', 'math check', 'audit', 'review', 'verify', or 'inspect' an uploaded document/spreadsheet, it is ALWAYS 'financial_analysis' (or 'general'). NEVER 'document_generation'! The user wants analysis in the chat, NOT a new file to download.\n"
     "  * Prior document generation in recent chat history MUST NOT cause a new greeting, question, or image explanation to become document_generation.\n"
     "- code: user wants working programming code, a script, or a debugging/programming solution as text.\n"
     "- financial_analysis: user asks about finance, valuation, LBO, DCF, metrics, KPIs — as text/explanation, not a downloadable file.\n"

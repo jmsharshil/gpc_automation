@@ -319,7 +319,7 @@
 #         logger.debug("Sending to OpenAI → model=%s temp=%s max_output_tokens=%s", model, temperature, max_tokens)
 
 #         try:
-#             from openai import OpenAI
+#             from openai import OpenAI, AsyncOpenAI
 #             client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
 
 #             def event_stream():
@@ -688,6 +688,12 @@ def _run_pdf_processing(chat, file_bytes: bytes, attachment_name: str) -> int:
     Runs async PDF processing in an isolated thread with its own event loop.
     Safe to call from any sync Django view regardless of IocpProactor state (Windows).
     """
+    chunks_count, _ = _run_pdf_processing_single(chat, file_bytes, attachment_name)
+    return chunks_count
+
+
+def _run_pdf_processing_single(chat, file_bytes: bytes, attachment_name: str) -> tuple[int, int]:
+    close_old_connections()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -696,87 +702,43 @@ def _run_pdf_processing(chat, file_bytes: bytes, attachment_name: str) -> int:
         )
     finally:
         loop.close()
-        
+        close_old_connections()
+
+
 # ====================== HELPER: PDF PROCESSING FOR RAG ======================
 
-async def process_pdf_for_rag(chat: ChatDemo, file_bytes: bytes, file_name: str) -> int:
+async def process_pdf_for_rag(chat: ChatDemo, file_bytes: bytes, file_name: str) -> tuple[int, int]:
     """
     Process PDF/image and create embeddings for RAG.
-    Returns: Number of chunks created
+    Returns: (Number of chunks created, total pages)
     """
-    doc_processing = None
-    doc_processing, _ = await sync_to_async(DocumentProcessingDemo.objects.get_or_create)(
-        chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
-    )
     try:
         # Extract text — async parallel OCR for image-based pages
         pages_text = await extract_text_from_uploaded_file_async(file_name, file_bytes)
- 
-        page_text_lengths = [len(text or "") for text in pages_text.values()]
-    
+        total_pages = len(pages_text)
+
         # Create chunks
         chunks = split_into_chunks(pages_text)
-        # if chunks:
-        #     logger.info(
-        #         "Created chunks for chat_id=%s chunk_count=%s first_chunk=%s last_chunk=%s",
-        #         chat.id,
-        #         len(chunks),
-        #         {
-        #             "page_number": chunks[0]["page_number"],
-        #             "chunk_index": chunks[0]["chunk_index"],
-        #             "char_count": chunks[0]["char_count"],
-        #         },
-        #         {
-        #             "page_number": chunks[-1]["page_number"],
-        #             "chunk_index": chunks[-1]["chunk_index"],
-        #             "char_count": chunks[-1]["char_count"],
-        #         },
-        #     )
-        # else:
-        #     logger.warning("No chunks were created for chat_id=%s", chat.id)
- 
-        # Update document processing status
-        # doc_processing, _ = await sync_to_async(DocumentProcessing.objects.get_or_create)(
-        #     chat=chat, defaults={'status': 'processing', 'started_at': timezone.now()}
-        # )
-        doc_processing.total_pages = len(pages_text)
-        await sync_to_async(doc_processing.save)()
- 
+
         # Get embeddings (batch by 50 to manage API rate limits)
         client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
- 
+
         chunk_batch_size = 50
         all_embedding_vectors = []
- 
+
         for batch_idx in range(0, len(chunks), chunk_batch_size):
             batch_chunks = chunks[batch_idx:batch_idx + chunk_batch_size]
             batch_texts = [chunk['text'] for chunk in batch_chunks]
-            # logger.info(
-            #     "Embedding chunk batch for chat_id=%s batch_number=%s batch_size=%s chunk_index_range=%s-%s",
-            #     chat.id,
-            #     batch_idx // chunk_batch_size + 1,
-            #     len(batch_chunks),
-            #     batch_chunks[0]['chunk_index'] if batch_chunks else None,
-            #     batch_chunks[-1]['chunk_index'] if batch_chunks else None,
-            # )
- 
+
             try:
                 response = client.embeddings.create(
                     model="text-embedding-3-small",
                     input=batch_texts,
                     encoding_format="float"
                 )
- 
+
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embedding_vectors.extend(batch_embeddings)
- 
-                # logger.info(
-                #     "Embedded chunk batch for chat_id=%s batch_number=%s embedded_count=%s total_embeddings=%s",
-                #     chat.id,
-                #     batch_idx // chunk_batch_size + 1,
-                #     len(batch_embeddings),
-                #     len(all_embedding_vectors),
-                # )
             except Exception as e:
                 logger.exception(
                     "Embedding batch failed for chat_id=%s batch_number=%s batch_size=%s",
@@ -785,7 +747,7 @@ async def process_pdf_for_rag(chat: ChatDemo, file_bytes: bytes, file_name: str)
                     len(batch_chunks),
                 )
                 raise
- 
+
         # Save chunks to database
         chunk_objects = []
         for chunk, embedding_vector in zip(chunks, all_embedding_vectors):
@@ -800,43 +762,19 @@ async def process_pdf_for_rag(chat: ChatDemo, file_bytes: bytes, file_name: str)
                 embedding_model='text-embedding-3-small'
             )
             chunk_objects.append(chunk_obj)
- 
-        # logger.info(
-        #     "Saving chunk objects for chat_id=%s chunk_object_count=%s",
-        #     chat.id,
-        #     len(chunk_objects),
-        # )
-        await sync_to_async(DocumentChunkDemo.objects.bulk_create)(chunk_objects, batch_size=100)
-        # logger.info(
-        #     "Saved document chunks for chat_id=%s saved_count=%s",
-        #     chat.id,
-        #     len(chunk_objects),
-        # )
- 
-        # Update processing status
-        doc_processing.status = 'completed'
-        doc_processing.total_chunks = len(chunks)
-        doc_processing.completed_at = timezone.now()
-        await sync_to_async(doc_processing.save)()
- 
+
+        if chunk_objects:
+            await sync_to_async(DocumentChunkDemo.objects.bulk_create)(chunk_objects, batch_size=100)
+
         # Update chat
-        chat.has_document = len(chunks) > 0
-        await sync_to_async(chat.save)()
-        # logger.info(
-        #     "Completed PDF processing for chat_id=%s total_pages=%s total_chunks=%s",
-        #     chat.id,
-        #     len(pages_text),
-        #     len(chunks),
-        # )
- 
-        return len(chunks)
- 
+        if len(chunks) > 0:
+            chat.has_document = True
+            await sync_to_async(chat.save)(update_fields=['has_document'])
+
+        return len(chunks), total_pages
+
     except Exception as e:
-        logger.exception("PDF processing failed for chat_id=%s: %s", chat.id, e)
-        if doc_processing is not None:
-            doc_processing.status = 'failed'
-            doc_processing.error_message = str(e)
-            await sync_to_async(doc_processing.save)()
+        logger.exception("PDF processing failed for chat_id=%s file=%s: %s", chat.id, file_name, e)
         raise
 
 
@@ -1003,7 +941,7 @@ class SendMessageAPIView(APIView):
         if attachments:
 
             processed_files = []
-            total_chunks = 0
+            valid_files_data = []
 
             try:
 
@@ -1018,7 +956,11 @@ class SendMessageAPIView(APIView):
                     if not attachment_name.lower().endswith(allowed_ext):
                         continue
 
+                    if attachment.size > MAX_UPLOAD_SIZE:
+                        continue
+
                     file_bytes = attachment.read()
+                    attachment.seek(0)
 
                     MessageDemo.objects.create(
                         chat=chat,
@@ -1029,18 +971,28 @@ class SendMessageAPIView(APIView):
                         attachment_content_type=attachment_content_type,
                     )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(
-                            _run_pdf_processing,
-                            chat,
-                            file_bytes,
-                            attachment_name
-                        )
-
-                        num_chunks = future.result()
-
-                    total_chunks += num_chunks
+                    valid_files_data.append((file_bytes, attachment_name))
                     processed_files.append(attachment_name)
+
+                if valid_files_data:
+                    chat.is_processing_document = True
+                    chat.save(update_fields=['is_processing_document'])
+
+                    doc_proc, _ = DocumentProcessingDemo.objects.get_or_create(chat=chat)
+                    doc_proc.status = 'processing'
+                    doc_proc.started_at = timezone.now()
+                    doc_proc.error_message = ''
+                    doc_proc.total_pages = 0
+                    doc_proc.processed_pages = 0
+                    doc_proc.total_chunks = 0
+                    doc_proc.completed_at = None
+                    doc_proc.save()
+
+                    threading.Thread(
+                        target=_process_attachments_in_background,
+                        args=(chat.id, valid_files_data, bool(user_text)),
+                        daemon=True
+                    ).start()
 
                 if not user_text:
 
@@ -1048,9 +1000,9 @@ class SendMessageAPIView(APIView):
                         chat=chat,
                         role='assistant',
                         content=(
-                            f'✅ {len(processed_files)} file(s) processed '
-                            f'({total_chunks} chunks).\n\n'
-                            + "\n".join(processed_files)
+                            f'✅ Uploaded {len(processed_files)} file(s):\n'
+                            + "\n".join(f"- {n}" for n in processed_files)
+                            + "\n\n⏳ Processing and indexing your documents in the background. You can track progress or start asking questions/instructions."
                         ),
                     )
 
@@ -1157,6 +1109,16 @@ class SendMessageAPIView(APIView):
             api_key=getattr(settings, 'OPENAI_API_KEY', None),
         )
 
+        chat.refresh_from_db(fields=['is_processing_document', 'has_document'])
+        if chat.is_processing_document and intent != 'document_generation':
+            wait_msg = MessageDemo.objects.create(
+                chat=chat,
+                role='assistant',
+                content="⏳ Still processing and indexing your uploaded document(s) in the background — please wait a few moments and ask again so I can answer using the full document context.",
+            )
+            serializer = MessageSerializer(wait_msg, context={'request': request})
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
         # --- Task 4: RAG context with similarity threshold ---
         rag_insufficient = False
         messages_payload = []
@@ -1176,27 +1138,36 @@ class SendMessageAPIView(APIView):
                 query_embedding = emb_response.data[0].embedding
                 max_chunks = getattr(user_setting, 'max_context_chunks', 5)
 
-                # 1. Chat-specific RAG
+                # 1. Chat-specific RAG (ChatGPT Token Budget Threshold)
                 if chat.has_document:
-                    relevant_chunks, max_sim = get_relevant_chunks_for_query(chat, query_embedding, max_chunks)
                     total_chat_chunks = DocumentChunkDemo.objects.filter(chat=chat).count()
-                    is_generic_query = any(k in user_text.lower() for k in [
-                        'explain', 'summarize', 'what is', 'what are', 'tell me about', 'overview', 'review', 'read this', 'this image', 'screenshot'
-                    ]) or len(user_text.strip().split()) <= 4
-
-                    if relevant_chunks and (max_sim >= RAG_SIMILARITY_THRESHOLD or is_generic_query or total_chat_chunks <= max_chunks):
-                        context_parts = [f"[Page {chunk.page_number}]\n{chunk.text}" for chunk in relevant_chunks]
+                    if total_chat_chunks <= 30:
+                        all_chunks = DocumentChunkDemo.objects.filter(chat=chat).order_by('page_number', 'chunk_index')
+                        context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in all_chunks]
                         rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
                         messages_payload.append({
                             'role': 'system',
-                            'content': f"🔗 You are answering based on the following document excerpts:\n{rag_context}"
+                            'content': f"🔗 Document Content (Complete Document):\n{rag_context}"
                         })
-                    elif not has_image_attachment:
-                        rag_insufficient = True
-                        logger.info(
-                            "RAG context weak for chat_id=%s max_sim=%.3f threshold=%.3f",
-                            chat.id, max_sim, RAG_SIMILARITY_THRESHOLD
-                        )
+                    else:
+                        relevant_chunks, max_sim = get_relevant_chunks_for_query(chat, query_embedding, max_chunks=8)
+                        is_generic_query = any(k in user_text.lower() for k in [
+                            'explain', 'summarize', 'what is', 'what are', 'tell me about', 'overview', 'review', 'read this', 'this image', 'screenshot'
+                        ]) or len(user_text.strip().split()) <= 4
+
+                        if relevant_chunks and (max_sim >= RAG_SIMILARITY_THRESHOLD or is_generic_query):
+                            context_parts = [f"[Page {chunk.page_number}]\n{chunk.text}" for chunk in relevant_chunks]
+                            rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
+                            messages_payload.append({
+                                'role': 'system',
+                                'content': f"🔗 You are answering based on the following document excerpts:\n{rag_context}"
+                            })
+                        elif not has_image_attachment:
+                            rag_insufficient = True
+                            logger.info(
+                                "RAG context weak for chat_id=%s max_sim=%.3f threshold=%.3f",
+                                chat.id, max_sim, RAG_SIMILARITY_THRESHOLD
+                            )
 
                 # 2. Business-level RAG (Organization Knowledge Base)
                 if has_business_docs:
@@ -1482,60 +1453,286 @@ class DocumentProcessingStatusAPIView(APIView):
         chat = get_object_or_404(ChatDemo, pk=chat_pk)
         
         try:
-            doc_processing = chat.document_processing
+            doc_processing = getattr(chat, 'document_processing_demo', None)
+            if doc_processing is None:
+                doc_processing = DocumentProcessingDemo.objects.filter(chat=chat).first()
+
+            if not doc_processing:
+                return Response({'status': 'none', 'is_processing': chat.is_processing_document}, status=status.HTTP_200_OK)
+
             return Response({
                 'status': doc_processing.status,
                 'total_pages': doc_processing.total_pages,
                 'processed_pages': doc_processing.processed_pages,
                 'total_chunks': doc_processing.total_chunks,
                 'error_message': doc_processing.error_message,
+                'started_at': doc_processing.started_at,
                 'completed_at': doc_processing.completed_at,
-            })
-        except DocumentProcessingDemo.DoesNotExist:
-            return Response({'status': 'none'}, status=status.HTTP_404_NOT_FOUND)
+                'is_processing': chat.is_processing_document,
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Failed to get document processing status for chat_id=%s: %s", chat.id, e)
+            return Response({'status': 'none', 'error': str(e)}, status=status.HTTP_200_OK)
 
 
 import threading
-import concurrent.futures  # keep import if used elsewhere; not used below anymore
 from django.db import close_old_connections
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB — adjust as needed
 
 
-def _process_attachment_in_background(chat_id, file_bytes, attachment_name):
-    close_old_connections()  # important: raw threads don't get Django's auto connection handling
+def _process_attachments_in_background(chat_id, files_data, has_user_prompt: bool = False):
+    """
+    Background worker thread to extract text, OCR if needed, chunk, embed, and store
+    document chunks for RAG in the database without blocking the HTTP request.
+    files_data: list of (file_bytes, attachment_name)
+    has_user_prompt: if True, skips posting the 'You can now ask questions' message
+                     because the streaming chat view will immediately answer the user prompt.
+    """
+    close_old_connections()
     chat = None
+    doc_processing = None
     try:
         chat = ChatDemo.objects.get(pk=chat_id)
-        num_chunks = _run_pdf_processing(chat, file_bytes, attachment_name)
+        chat.is_processing_document = True
+        chat.save(update_fields=['is_processing_document'])
 
-        if num_chunks > 0:
-            MessageDemo.objects.create(
-                chat=chat,
-                role='assistant',
-                content=f'✅ 1 file(s) processed ({num_chunks} chunks).\n\n{attachment_name}',
-            )
+        doc_processing, _ = DocumentProcessingDemo.objects.get_or_create(chat=chat)
+        doc_processing.status = 'processing'
+        doc_processing.started_at = timezone.now()
+        doc_processing.error_message = ''
+        doc_processing.total_pages = 0
+        doc_processing.processed_pages = 0
+        doc_processing.total_chunks = 0
+        doc_processing.completed_at = None
+        doc_processing.save()
+
+        total_chunks = 0
+        total_pages = 0
+
+        # Process multiple files concurrently to reduce total wait time
+        if len(files_data) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(4, len(files_data))) as executor:
+                futures = [
+                    executor.submit(_run_pdf_processing_single, chat, fb, name)
+                    for fb, name in files_data
+                ]
+                for f in futures:
+                    try:
+                        chunks_count, pages_count = f.result()
+                        total_chunks += chunks_count
+                        total_pages += pages_count
+                        doc_processing.total_pages = total_pages
+                        doc_processing.processed_pages = total_pages
+                        doc_processing.total_chunks = total_chunks
+                        doc_processing.save(update_fields=['total_pages', 'processed_pages', 'total_chunks'])
+                    except Exception as fe:
+                        logger.error("Parallel file processing error: %s", fe)
         else:
-            MessageDemo.objects.create(
-                chat=chat,
-                role='assistant',
-                content=f"⚠️ No extractable text found in {attachment_name}.",
-            )
+            for file_bytes, attachment_name in files_data:
+                chunks_count, pages_count = _run_pdf_processing_single(chat, file_bytes, attachment_name)
+                total_chunks += chunks_count
+                total_pages += pages_count
+
+                doc_processing.total_pages = total_pages
+                doc_processing.processed_pages = total_pages
+                doc_processing.total_chunks = total_chunks
+                doc_processing.save(update_fields=['total_pages', 'processed_pages', 'total_chunks'])
+
+        doc_processing.status = 'completed'
+        doc_processing.completed_at = timezone.now()
+        doc_processing.save()
+
+        chat.has_document = total_chunks > 0
+        chat.is_processing_document = False
+        chat.save(update_fields=['has_document', 'is_processing_document'])
+
+        # Only post generic upload message if the user did NOT supply a prompt
+        if not has_user_prompt:
+            file_list_str = "\n".join(f"- {name}" for _, name in files_data)
+            if total_chunks > 0:
+                MessageDemo.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=f"✅ {len(files_data)} file(s) processed and indexed ({total_chunks} chunks):\n{file_list_str}\n\nYou can now ask any questions about these documents!",
+                )
+            else:
+                MessageDemo.objects.create(
+                    chat=chat,
+                    role='assistant',
+                    content=f"⚠️ Uploaded file(s) processed, but no extractable text was found:\n{file_list_str}",
+                )
 
     except Exception as e:
-        if chat is None:
-            chat = ChatDemo.objects.filter(pk=chat_id).first()
-        if chat:
+        logger.exception("Background document processing failed for chat_id=%s: %s", chat_id, e)
+        if doc_processing is None:
+            doc_processing = DocumentProcessingDemo.objects.filter(chat_id=chat_id).first()
+        if doc_processing:
+            doc_processing.status = 'failed'
+            doc_processing.error_message = str(e)
+            doc_processing.completed_at = timezone.now()
+            doc_processing.save()
+
+        ChatDemo.objects.filter(pk=chat_id).update(is_processing_document=False)
+        chat = ChatDemo.objects.filter(pk=chat_id).first()
+        if chat and not has_user_prompt:
             MessageDemo.objects.create(
                 chat=chat,
                 role='assistant',
-                content=f"❌ Failed to process file: {type(e).__name__}: {str(e)}",
+                content=f"❌ Failed to process document(s): {type(e).__name__}: {str(e)}",
             )
-            ChatDemo.objects.filter(pk=chat_id).update(has_document=False)
-
     finally:
-        ChatDemo.objects.filter(pk=chat_id).update(is_processing_document=False)
         close_old_connections()
+
+
+def _assemble_prompt_and_rag_sync(
+    chat,
+    user_text,
+    user_msg_pk,
+    intent,
+    relevant_memory,
+    user_setting,
+    query_embedding,
+    has_image_attachment,
+    image_b64,
+    image_content_type,
+    prev_generated_file_name,
+):
+    """
+    Synchronously queries the database and assembles the messages_payload.
+    Safe to execute in sync_to_async worker thread without SynchronousOnlyOperation errors.
+    """
+    rag_insufficient = False
+    messages_payload = []
+
+    has_business_docs = BusinessDocumentChunkDemo.objects.filter(
+        business_document__business_memory__is_active=True
+    ).exists()
+
+    chat.refresh_from_db(fields=['has_document'])
+
+    if (chat.has_document or has_business_docs) and query_embedding:
+        try:
+            max_chunks = getattr(user_setting, 'max_context_chunks', 5)
+
+            # 1. Chat-specific RAG (ChatGPT Token Budget Threshold)
+            if chat.has_document:
+                total_chat_chunks = DocumentChunkDemo.objects.filter(chat=chat).count()
+                if total_chat_chunks <= 30:
+                    all_chunks = DocumentChunkDemo.objects.filter(chat=chat).order_by('page_number', 'chunk_index')
+                    context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in all_chunks]
+                    rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
+                    messages_payload.append({
+                        'role': 'system',
+                        'content': f"🔗 Document Content (Complete Document):\n{rag_context}"
+                    })
+                else:
+                    relevant_chunks, max_sim = get_relevant_chunks_for_query(chat, query_embedding, max_chunks=8)
+                    is_generic_query = any(k in (user_text or '').lower() for k in [
+                        'explain', 'summarize', 'what is', 'what are', 'tell me about', 'overview', 'review', 'read this', 'this image', 'screenshot'
+                    ]) or len((user_text or '').strip().split()) <= 4
+
+                    if relevant_chunks and (max_sim >= RAG_SIMILARITY_THRESHOLD or is_generic_query):
+                        context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in relevant_chunks]
+                        rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
+                        messages_payload.append({
+                            'role': 'system',
+                            'content': f"🔗 Document excerpts:\n{rag_context}"
+                        })
+                    elif not has_image_attachment:
+                        rag_insufficient = True
+                        logger.info(
+                            "RAG context weak in streaming view for chat_id=%s max_sim=%.3f",
+                            chat.id, max_sim,
+                        )
+
+            # 2. Business-level RAG (Organization Knowledge Base)
+            if has_business_docs:
+                b_chunks, b_max_sim = get_relevant_business_chunks_for_query(query_embedding, max_chunks=3)
+                if b_chunks and b_max_sim >= RAG_SIMILARITY_THRESHOLD:
+                    b_context_parts = [
+                        f"[{c.business_document.name} - Page {c.page_number}]\n{c.text}"
+                        for c in b_chunks
+                    ]
+                    b_rag_context = "\n\n" + "=" * 50 + "\n\n".join(b_context_parts)
+                    messages_payload.append({
+                        'role': 'system',
+                        'content': f"🏢 Organization Knowledge Base Excerpts:\n{b_rag_context}"
+                    })
+
+        except Exception as e:
+            logger.error("RAG retrieval failed in streaming view: %s", e)
+
+    # Build intent-adaptive system prompt
+    intent_system_prompt = build_system_prompt(intent, rag_insufficient=rag_insufficient)
+    custom_chat_prompt = chat.system_prompt or ""
+    if custom_chat_prompt:
+        intent_system_prompt = custom_chat_prompt + "\n\n" + intent_system_prompt
+    business_mem_str = BusinessContextMemoryDemo.get_active_memory()
+    if business_mem_str:
+        intent_system_prompt += f"\n\n[BUSINESS CONTEXT MEMORY (Organization Rules & Ground Truth)]\n{business_mem_str}\n"
+    if relevant_memory:
+        intent_system_prompt += f"\n\n[USER CONTEXT MEMORY (Past Facts & Preferences)]\n{relevant_memory}\n"
+
+    if has_image_attachment:
+        intent_system_prompt += (
+            "\n\n[USER IMAGE ATTACHMENT: An image/screenshot is provided directly in the user message. "
+            "Visually examine the image content to answer questions, explain code or UI, and provide detailed insights accurately.]\n"
+        )
+
+    # Files note for sandbox
+    att_names = []
+    tpl_report = ""
+    try:
+        recent_att_msgs = list(
+            chat.messages_demo.exclude(attachment='').exclude(attachment__isnull=True).order_by('-created_at')[:5]
+        )
+        for _am in recent_att_msgs:
+            _n = os.path.basename(_am.attachment_name or '')
+            if _n and _n not in att_names:
+                att_names.append(_n)
+                if _n.lower().endswith('.pptx') and not tpl_report:
+                    try:
+                        from .pptx_quality import describe_template
+                        with _am.attachment.open('rb') as _fh:
+                            tpl_report = describe_template(_fh.read(), _n)
+                    except Exception as _te:
+                        logger.warning("Could not build template report for %s: %s", _n, _te)
+    except Exception as _e:
+        logger.warning("Failed to collect recent attachment names: %s", _e)
+
+    if prev_generated_file_name:
+        _pn = os.path.basename(prev_generated_file_name)
+        if _pn not in att_names:
+            att_names.append(_pn)
+    intent_system_prompt += files_note(att_names) + tpl_report
+
+    messages_payload.insert(0, {'role': 'system', 'content': intent_system_prompt})
+
+    # Conversation history
+    recent_messages = list(chat.messages_demo.all().order_by('-created_at')[:10])
+    for m in reversed(recent_messages):
+        if m.pk != user_msg_pk:
+            messages_payload.append({'role': m.role, 'content': m.content or ''})
+
+    if has_image_attachment and image_b64:
+        messages_payload.append({
+            'role': 'user',
+            'content': [
+                {"type": "text", "text": user_text or "Please analyze and explain this uploaded image."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image_content_type};base64,{image_b64}"
+                    }
+                }
+            ]
+        })
+    else:
+        messages_payload.append({'role': 'user', 'content': user_text})
+
+    return messages_payload
 
 
 # ====================== STREAMING CHAT (SSE) ======================
@@ -1567,7 +1764,7 @@ class StreamingChatAPIView(APIView):
         attachment_content_type = (getattr(first_attachment, 'content_type', '') if first_attachment else '')
         allowed_ext = ('.pdf', '.docx', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt', '.jpg', '.jpeg', '.png', '.webp')
 
-        # --- Handle file upload for RAG (now non-blocking) ---
+        # --- Handle file upload for RAG (non-blocking background processing) ---
         if attachments:
             try:
                 # Delete old chunks ONCE
@@ -1575,6 +1772,7 @@ class StreamingChatAPIView(APIView):
 
                 queued_files = []
                 rejected_files = []
+                valid_files_data = []
 
                 for attachment in attachments:
                     name = attachment.name
@@ -1601,21 +1799,7 @@ class StreamingChatAPIView(APIView):
                         attachment_content_type=content_type,
                     )
 
-                    # mark chat as processing BEFORE starting the thread
-                    if user_text:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                                future = executor.submit(
-                                    _run_pdf_processing,
-                                    chat,
-                                    file_bytes,
-                                    name
-                                )
-                                future.result()    
-                    else :
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(_run_pdf_processing, chat, file_bytes, name)
-                            future.result()
-
+                    valid_files_data.append((file_bytes, name))
                     queued_files.append(name)
 
                 if rejected_files:
@@ -1628,47 +1812,52 @@ class StreamingChatAPIView(APIView):
                         ),
                     )
 
-                if not user_text:
-                    chat.refresh_from_db(fields=['has_document'])
+                if valid_files_data:
+                    chat.is_processing_document = True
+                    chat.save(update_fields=['is_processing_document'])
 
-                    if queued_files and chat.has_document:
-                        # Processing already finished synchronously above (that's why this
-                        # request took a while) — post a status message, then keep going
-                        # so we generate a real answer instead of stopping here.
-                        MessageDemo.objects.create(
+                    doc_proc, _ = DocumentProcessingDemo.objects.get_or_create(chat=chat)
+                    doc_proc.status = 'processing'
+                    doc_proc.started_at = timezone.now()
+                    doc_proc.error_message = ''
+                    doc_proc.total_pages = 0
+                    doc_proc.processed_pages = 0
+                    doc_proc.total_chunks = 0
+                    doc_proc.completed_at = None
+                    doc_proc.save()
+
+                    threading.Thread(
+                        target=_process_attachments_in_background,
+                        args=(chat.id, valid_files_data, bool(user_text)),
+                        daemon=True
+                    ).start()
+
+                if not user_text:
+                    if queued_files:
+                        completion_msg = MessageDemo.objects.create(
                             chat=chat,
                             role='assistant',
                             content=(
-                                f"✅ {len(queued_files)} file(s) processed.\n\n"
-                                + "\n".join(queued_files)
+                                f"✅ Uploaded {len(queued_files)} file(s):\n"
+                                + "\n".join(f"- {n}" for n in queued_files)
+                                + "\n\n⏳ Processing and indexing your documents in the background. You can track progress or start asking questions/instructions."
                             ),
                         )
-                        user_text = (
-                            "The document has been uploaded and processed. Give a brief "
-                            "summary of its key contents and confirm you're ready to "
-                            "answer questions about it."
-                        )
-                        auto_generated_prompt = True
                     else:
-                        # Nothing usable came out of processing — no point calling the
-                        # model, since there's nothing to answer about.
-                        reason = (
-                            "⚠️ No valid files to process."
-                            if not queued_files else
-                            "⚠️ No extractable text was found in the uploaded file(s), so "
-                            "I don't have any document content to answer from."
-                        )
                         completion_msg = MessageDemo.objects.create(
-                            chat=chat, role='assistant', content=reason,
+                            chat=chat,
+                            role='assistant',
+                            content="⚠️ No valid files to process.",
                         )
-                        serializer = MessageSerializer(completion_msg, context={'request': request})
-                        return Response(serializer.data, status=status.HTTP_201_CREATED)
+                    serializer = MessageSerializer(completion_msg, context={'request': request})
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
 
             except Exception as e:
+                logger.exception("Failed during file upload preparation for chat_id=%s: %s", chat.id, e)
                 error_msg = MessageDemo.objects.create(
                     chat=chat,
                     role='assistant',
-                    content=f"❌ Failed to process file: {type(e).__name__}: {str(e)}",
+                    content=f"❌ Failed to process file upload: {type(e).__name__}: {str(e)}",
                 )
                 serializer = MessageSerializer(error_msg, context={'request': request})
                 return Response(serializer.data, status=status.HTTP_400_BAD_REQUEST)
@@ -1690,24 +1879,6 @@ class StreamingChatAPIView(APIView):
                 attachment_content_type=attachment_content_type,
                 metadata={'auto_generated': True} if auto_generated_prompt else {},
             )
-
-        # 🔒 NEW: refuse to answer while document is still being processed
-        chat.refresh_from_db(fields=['is_processing_document', 'has_document'])
-        if chat.is_processing_document:
-            wait_msg = MessageDemo.objects.create(
-                chat=chat,
-                role='assistant',
-                content="⏳ Still processing your uploaded document — please wait a few seconds and ask again so I can answer using the full document context.",
-            )
-
-            def wait_stream():
-                yield f"data: {wait_msg.content}\n\n"
-                yield "data: [DONE]\n\n"
-
-            response = StreamingHttpResponse(wait_stream(), content_type='text/event-stream')
-            response['Cache-Control'] = 'no-cache'
-            response['X-Accel-Buffering'] = 'no'
-            return response
 
         # ── Look up previously generated file so the sandbox can pre-load it ──
         prev_generated_file_path = None
@@ -1774,130 +1945,6 @@ class StreamingChatAPIView(APIView):
             api_key=getattr(settings, 'OPENAI_API_KEY', None),
         )
 
-        # Task 4: RAG context with similarity threshold check
-        rag_insufficient = False
-        messages_payload = []
-
-        has_business_docs = BusinessDocumentChunkDemo.objects.filter(
-            business_document__business_memory__is_active=True
-        ).exists()
-
-        if chat.has_document or has_business_docs:
-            try:
-                emb_client = OpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
-                emb_response = emb_client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=[user_text],
-                    encoding_format="float",
-                )
-                query_embedding = emb_response.data[0].embedding
-                max_chunks = getattr(user_setting, 'max_context_chunks', 5)
-
-                # 1. Chat-specific RAG
-                if chat.has_document:
-                    relevant_chunks, max_sim = get_relevant_chunks_for_query(chat, query_embedding, max_chunks)
-                    total_chat_chunks = DocumentChunkDemo.objects.filter(chat=chat).count()
-                    is_generic_query = any(k in user_text.lower() for k in [
-                        'explain', 'summarize', 'what is', 'what are', 'tell me about', 'overview', 'review', 'read this', 'this image', 'screenshot'
-                    ]) or len(user_text.strip().split()) <= 4
-
-                    if relevant_chunks and (max_sim >= RAG_SIMILARITY_THRESHOLD or is_generic_query or total_chat_chunks <= max_chunks):
-                        context_parts = [f"[Page {c.page_number}]\n{c.text}" for c in relevant_chunks]
-                        rag_context = "\n\n" + "=" * 50 + "\n\n".join(context_parts)
-                        messages_payload.append({
-                            'role': 'system',
-                            'content': f"🔗 Document excerpts:\n{rag_context}"
-                        })
-                    elif not has_image_attachment:
-                        rag_insufficient = True
-                        logger.info(
-                            "RAG context weak in streaming view for chat_id=%s max_sim=%.3f",
-                            chat.id, max_sim,
-                        )
-
-                # 2. Business-level RAG (Organization Knowledge Base)
-                if has_business_docs:
-                    b_chunks, b_max_sim = get_relevant_business_chunks_for_query(query_embedding, max_chunks=3)
-                    if b_chunks and b_max_sim >= RAG_SIMILARITY_THRESHOLD:
-                        b_context_parts = [
-                            f"[{c.business_document.name} - Page {c.page_number}]\n{c.text}"
-                            for c in b_chunks
-                        ]
-                        b_rag_context = "\n\n" + "=" * 50 + "\n\n".join(b_context_parts)
-                        messages_payload.append({
-                            'role': 'system',
-                            'content': f"🏢 Organization Knowledge Base Excerpts:\n{b_rag_context}"
-                        })
-
-            except Exception as e:
-                logger.error("RAG retrieval failed in streaming view: %s", e)
-
-
-        # Task 2: Build intent-adaptive system prompt
-        intent_system_prompt = build_system_prompt(intent, rag_insufficient=rag_insufficient)
-        custom_chat_prompt = chat.system_prompt or ""
-        if custom_chat_prompt:
-            intent_system_prompt = custom_chat_prompt + "\n\n" + intent_system_prompt
-        business_mem_str = BusinessContextMemoryDemo.get_active_memory()
-        if business_mem_str:
-            intent_system_prompt += f"\n\n[BUSINESS CONTEXT MEMORY (Organization Rules & Ground Truth)]\n{business_mem_str}\n"
-        if relevant_memory:
-            intent_system_prompt += f"\n\n[USER CONTEXT MEMORY (Past Facts & Preferences)]\n{relevant_memory}\n"
-
-        if has_image_attachment:
-            intent_system_prompt += (
-                "\n\n[USER IMAGE ATTACHMENT: An image/screenshot is provided directly in the user message. "
-                "Visually examine the image content to answer questions, explain code or UI, and provide detailed insights accurately.]\n"
-            )
-
-        # ── Files the sandbox can see: only the NAMES go into the prompt (cheap). ──
-        # The file bytes are read lazily, and only if the model actually runs code.
-        att_names = []
-        tpl_report = ""      # geometry of an attached .pptx template (safe areas, keep-out zones, theme)
-        try:
-            for _am in chat.messages_demo.exclude(attachment='').exclude(attachment__isnull=True).order_by('-created_at')[:5]:
-                _n = os.path.basename(_am.attachment_name or '')
-                if _n and _n not in att_names:
-                    att_names.append(_n)
-                    if _n.lower().endswith('.pptx') and not tpl_report:
-                        try:
-                            from .pptx_quality import describe_template
-                            with _am.attachment.open('rb') as _fh:
-                                tpl_report = describe_template(_fh.read(), _n)
-                        except Exception as _te:
-                            logger.warning("Could not build template report for %s: %s", _n, _te)
-        except Exception as _e:
-            logger.warning("Failed to collect recent attachment names: %s", _e)
-        if prev_generated_file_name:
-            _pn = os.path.basename(prev_generated_file_name)
-            if _pn not in att_names:
-                att_names.append(_pn)
-        intent_system_prompt += files_note(att_names) + tpl_report
-
-        messages_payload.insert(0, {'role': 'system', 'content': intent_system_prompt})
-
-        # Conversation history
-        recent_messages = chat.messages_demo.all().order_by('-created_at')[:10][::-1]
-        for m in recent_messages:
-            if m.pk != user_msg.pk:
-                messages_payload.append({'role': m.role, 'content': m.content or ''})
-
-        if has_image_attachment and image_b64:
-            messages_payload.append({
-                'role': 'user',
-                'content': [
-                    {"type": "text", "text": user_text or "Please analyze and explain this uploaded image."},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{image_content_type};base64,{image_b64}"
-                        }
-                    }
-                ]
-            })
-        else:
-            messages_payload.append({'role': 'user', 'content': user_text})
-
         # Task 1+3: Model params with reasoning_effort + per-intent max_tokens
         model = (
             request.data.get('model') or
@@ -1922,7 +1969,6 @@ class StreamingChatAPIView(APIView):
             model, intent, max_tokens, is_reasoning,
         )
 
-
         # --- SSE generator with document generation support ---
         async def event_stream():
             import time
@@ -1940,6 +1986,82 @@ class StreamingChatAPIView(APIView):
 
             # Tracks the files generated during this stream session
             generated_files_meta = []
+
+            # ------------------------------------------------------------------
+            # Step 1: Background indexing wait loop with keep-alive heartbeats
+            # Never timeout (prevents 504) and never drop user prompt!
+            # ------------------------------------------------------------------
+            await sync_to_async(chat.refresh_from_db)(fields=['is_processing_document', 'has_document'])
+            if chat.is_processing_document and intent != 'document_generation':
+                yield sse(STATUS, {"stage": "indexing", "message": "⏳ Processing and indexing your uploaded document(s)..."})
+                wait_start = time.time()
+                last_reported_pages = -1
+
+                while True:
+                    await asyncio.sleep(1.5)
+                    await sync_to_async(chat.refresh_from_db)(fields=['is_processing_document', 'has_document'])
+                    if not chat.is_processing_document:
+                        break
+
+                    doc_proc = await sync_to_async(DocumentProcessingDemo.objects.filter(chat=chat).first)()
+                    if doc_proc:
+                        if doc_proc.status == 'failed':
+                            err = doc_proc.error_message or "Document processing failed"
+                            yield sse_error(f"❌ Document indexing failed: {err}")
+                            yield sse_done()
+                            return
+
+                        p_done = doc_proc.processed_pages
+                        p_total = doc_proc.total_pages
+                        if p_done != last_reported_pages and p_done > 0:
+                            last_reported_pages = p_done
+                            msg = f"⏳ Indexing documents ({p_done}/{p_total or '...'} pages)..." if p_total else f"⏳ Indexing documents ({p_done} pages)..."
+                            yield sse(STATUS, {"stage": "indexing", "message": msg})
+                        else:
+                            yield sse(STATUS, {"stage": "heartbeat", "message": "⏳ Indexing in progress..."})
+
+                    if time.time() - wait_start > 300:
+                        yield sse(STATUS, {"stage": "warning", "message": "⚠️ Document indexing took longer than expected. Proceeding with analysis..."})
+                        break
+
+                yield sse(STATUS, {"stage": "indexing_done", "message": "✅ Documents indexed. Analyzing and generating answer..."})
+
+            # ------------------------------------------------------------------
+            # Step 2: Build messages_payload now that all chunks exist in DB
+            # ------------------------------------------------------------------
+            client = AsyncOpenAI(api_key=getattr(settings, 'OPENAI_API_KEY', None))
+
+            query_embedding = None
+            has_docs = await sync_to_async(
+                lambda: chat.has_document or BusinessDocumentChunkDemo.objects.filter(
+                    business_document__business_memory__is_active=True
+                ).exists()
+            )()
+
+            if has_docs and user_text:
+                try:
+                    emb_response = await client.embeddings.create(
+                        model="text-embedding-3-small",
+                        input=[user_text],
+                        encoding_format="float",
+                    )
+                    query_embedding = emb_response.data[0].embedding
+                except Exception as e:
+                    logger.error("Embedding creation failed in streaming view: %s", e)
+
+            messages_payload = await sync_to_async(_assemble_prompt_and_rag_sync)(
+                chat=chat,
+                user_text=user_text,
+                user_msg_pk=user_msg.pk,
+                intent=intent,
+                relevant_memory=relevant_memory,
+                user_setting=user_setting,
+                query_embedding=query_embedding,
+                has_image_attachment=has_image_attachment,
+                image_b64=image_b64,
+                image_content_type=image_content_type,
+                prev_generated_file_name=prev_generated_file_name,
+            )
 
             # ------------------------------------------------------------------
             # Input files are loaded LAZILY (only if the model runs code) and the
@@ -2276,7 +2398,7 @@ class EditAndResendAPIView(APIView):
                 chat.id, model, intent, max_tokens
             )
 
-            client = OpenAI(
+            client = AsyncOpenAI(
                 api_key=getattr(
                     settings,
                     "OPENAI_API_KEY",
@@ -2284,7 +2406,7 @@ class EditAndResendAPIView(APIView):
                 )
             )
 
-            def event_stream():
+            async def event_stream():
                 full_text = []
 
                 try:
@@ -2300,50 +2422,42 @@ class EditAndResendAPIView(APIView):
                     else:
                         call_kwargs["temperature"] = temperature
 
-                    with client.chat.completions.create(**call_kwargs) as stream:
+                    stream = await client.chat.completions.create(**call_kwargs)
 
-                        for chunk in stream:
+                    async for chunk in stream:
+                        delta = (
+                            chunk.choices[0].delta
+                            if chunk.choices
+                            else None
+                        )
 
-                            delta = (
-                                chunk.choices[0].delta
-                                if chunk.choices
-                                else None
-                            )
-
-                            if delta and delta.content:
-                                text_piece = delta.content
-
-                                full_text.append(text_piece)
-
-                                escaped = text_piece.replace(
-                                    "\n",
-                                    "\\n"
-                                )
-
-                                yield f"data: {escaped}\n\n"
+                        if delta and delta.content:
+                            text_piece = delta.content
+                            full_text.append(text_piece)
+                            escaped = text_piece.replace("\n", "\\n")
+                            yield f"data: {escaped}\n\n"
 
                     assistant_text = "".join(full_text)
 
-                    MessageDemo.objects.create(
+                    await MessageDemo.objects.acreate(
                         chat=chat,
                         role="assistant",
                         content=assistant_text,
                         metadata={
                             "streaming": True,
                             "edited_from_message": msg.pk,
-                            "intent": intent,    # Task 2
+                            "intent": intent,
                         }
                     )
 
                     # TRIGGER MEMORY UPDATE
-                    trigger_memory_update_async(user.id, chat.id)
+                    await sync_to_async(trigger_memory_update_async)(user.id, chat.id)
 
                 except Exception as e:
                     logger.exception(
                         "Edit & resend streaming failed: %s",
                         e
                     )
-
                     yield f"data: [ERROR] {str(e)}\n\n"
 
                 finally:

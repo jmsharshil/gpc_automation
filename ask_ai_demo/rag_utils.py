@@ -326,6 +326,7 @@ from io import BytesIO
 from docx import Document
 from pptx import Presentation
 import pandas as pd
+import openpyxl
  
 logger = logging.getLogger(__name__)
  
@@ -525,23 +526,82 @@ async def extract_text_from_docx_async(file_bytes: bytes):
     return pages
 
 async def extract_text_from_excel_async(file_bytes: bytes):
+    """
+    Extracts structured content from Excel workbooks.
+    Preserves:
+    - Sheet / Exhibit names
+    - Configured Print Area boundaries
+    - Exact Cell Coordinates (e.g. A1, C15)
+    - Formula expressions (e.g. =SUM(B1:B10))
+    - Hardcoded numbers vs. formulas (for math audit and model verification)
+    - Error strings (#REF!, #DIV/0!, #VALUE!, etc.)
+    Falls back gracefully to pandas if openpyxl fails (e.g. for legacy .xls files).
+    """
+    try:
+        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=False)
+        pages = {}
+
+        for idx, sheet_name in enumerate(wb.sheetnames, start=1):
+            ws = wb[sheet_name]
+            lines = [f"=== Exhibit / Sheet: {sheet_name} ==="]
+
+            # Detect Print Area
+            print_area = ws.print_area
+            ranges = []
+            if print_area:
+                raw_areas = print_area if isinstance(print_area, list) else [print_area]
+                for pa in raw_areas:
+                    clean = str(pa).split('!')[-1].replace('$', '').strip()
+                    if clean:
+                        ranges.append(clean)
+
+            if ranges:
+                lines.append(f"Configured Print Area: {', '.join(ranges)}")
+            else:
+                lines.append("Configured Print Area: None (Full Sheet Review)")
+
+            target_ranges = ranges if ranges else [ws.dimensions or 'A1:Z100']
+            for r_str in target_ranges:
+                try:
+                    for row in ws[r_str]:
+                        row_items = []
+                        for cell in row:
+                            if cell.value is None:
+                                continue
+                            coord = cell.coordinate
+                            val = str(cell.value).strip()
+                            if not val:
+                                continue
+
+                            is_formula = isinstance(cell.value, str) and val.startswith('=')
+                            has_error = any(err in val for err in ['#REF!', '#DIV/0!', '#VALUE!', '#NAME?', '#N/A'])
+
+                            if has_error:
+                                row_items.append(f"[{coord}] FORMULA_ERROR: {val}")
+                            elif is_formula:
+                                row_items.append(f"[{coord}] FORMULA: {val}")
+                            elif isinstance(cell.value, (int, float)):
+                                row_items.append(f"[{coord}] HARDCODED_NUMBER: {val}")
+                            else:
+                                row_items.append(f"[{coord}] TEXT: {val}")
+                        if row_items:
+                            lines.append(" | ".join(row_items))
+                except Exception as range_err:
+                    logger.warning("Error reading range %s in sheet %s: %s", r_str, sheet_name, range_err)
+
+            pages[idx] = "\n".join(lines)
+
+        if pages:
+            return pages
+
+    except Exception as e:
+        logger.warning("openpyxl extraction failed (%s), falling back to pandas: %s", type(e).__name__, e)
+
     excel_file = pd.ExcelFile(BytesIO(file_bytes))
-
     pages = {}
-
     for idx, sheet_name in enumerate(excel_file.sheet_names, start=1):
-
-        df = pd.read_excel(
-            excel_file,
-            sheet_name=sheet_name,
-            dtype=str
-        ).fillna("")
-
-        pages[idx] = (
-            f"Sheet: {sheet_name}\n\n"
-            + df.to_string(index=False)
-        )
-
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str).fillna("")
+        pages[idx] = f"Sheet: {sheet_name}\n\n" + df.to_string(index=False)
     return pages
 
 async def extract_text_from_ppt_async(file_bytes: bytes):
@@ -603,6 +663,7 @@ async def extract_text_from_uploaded_file_async(
 
     elif lower.endswith((".xlsx", ".xls")):
         return await extract_text_from_excel_async(file_bytes)
+
 
     elif lower.endswith((".pptx", ".ppt")):
         return await extract_text_from_ppt_async(file_bytes)

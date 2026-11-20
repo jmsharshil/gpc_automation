@@ -22,7 +22,8 @@ from .views import (
     ChatListCreateAPIView, ChatRetrieveAPIView,
     MessageListAPIView, SendMessageAPIView, DeleteChatAPIView,
     UserOpenAISettingAPIView, StreamingChatAPIView, ChatNameListAPIView, EditAndResendAPIView, ClearChatSessionAPIView, UpdateGlobalOpenAISettingsAPIView,
-    BusinessContextMemoryAPIView, BusinessDocumentDeleteAPIView
+    BusinessContextMemoryAPIView, BusinessDocumentDeleteAPIView,
+    DocumentProcessingStatusAPIView
 )
 
 urlpatterns = [
@@ -32,7 +33,7 @@ urlpatterns = [
     path('chats/<int:chat_pk>/messages/send/', SendMessageAPIView.as_view(), name='message-send'),
     path('chats/<int:chat_pk>/messages/stream/', StreamingChatAPIView.as_view(), name='message-stream'),
     path('chats/<int:chat_pk>/messages/<int:message_pk>/edit-and-resend/', EditAndResendAPIView.as_view(), name='edit-and-resend'),
-    # path('chats/<int:chat_pk>/document-status/', DocumentProcessingStatusAPIView.as_view()),
+    path('chats/<int:chat_pk>/document-status/', DocumentProcessingStatusAPIView.as_view(), name='document-status'),
     path('chats/<int:chat_pk>/delete/', DeleteChatAPIView.as_view(), name='chat-delete'),
     # path('chats/delete-bulk/', BulkDeleteChatsAPIView.as_view(), name='chat-delete-bulk'),
     path('user/openai-settings/', UserOpenAISettingAPIView.as_view(), name='user-openai-settings'),
